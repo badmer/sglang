@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
@@ -823,6 +824,13 @@ class DeepseekV4AscendAttnBackend(
             for pool in self.token_to_kv_pool.compress_state_pools
             if pool is not None
         }
+        # A/B switch: SGLANG_DSPARK_METADATA_HOST=1 replaces the draft worker's
+        # _C_ascend.npu_sparse_attn_sharedkv_metadata call with the host-CPU
+        # implementation in sgl-kernel-npu (byte-identical output).
+        self._use_host_sparse_metadata = (
+            os.environ.get("SGLANG_DSPARK_METADATA_HOST", "0") == "1"
+        )
+        self._host_sparse_topology = None  # (aic, aiv, soc), queried lazily once
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1502,6 +1510,50 @@ class DeepseekV4AscendAttnBackend(
             is_nextn=False,
         )
 
+    def _host_sparse_topology_cached(self):
+        """(aic, aiv, soc) queried once for the host metadata op."""
+        if self._host_sparse_topology is None:
+            props = torch.npu.get_device_properties(self.device)
+            cube = int(getattr(props, "cube_core_num", 0))
+            vec = int(getattr(props, "vector_core_num", 0))
+            name = str(getattr(props, "name", ""))
+            if cube <= 0 or vec <= 0:
+                raise RuntimeError(
+                    "SGLANG_DSPARK_METADATA_HOST=1 requires readable NPU core "
+                    f"counts, got cube={cube}, vector={vec}"
+                )
+            self._host_sparse_topology = (cube, vec, name)
+        return self._host_sparse_topology
+
+    def _host_sparse_metadata_call(self, kwargs: dict, cu_q_cpu, seq_kv_cpu):
+        """Host-CPU variant of npu_sparse_attn_sharedkv_metadata (sgl-kernel-npu).
+
+        Byte-identical output to the AICPU op; takes CPU int32 seq-lens and returns
+        a device int32[1024] tensor (the op performs the 4 KB H2D internally).
+        """
+        aic, aiv, soc = self._host_sparse_topology_cached()
+        return torch.ops.npu.sparse_attn_sharedkv_metadata_host(
+            kwargs["num_heads_q"],
+            kwargs["num_heads_kv"],
+            kwargs["head_dim"],
+            aic,
+            aiv,
+            soc,
+            kwargs["layout_q"],
+            kwargs["layout_kv"],
+            cu_q_cpu,
+            seq_kv_cpu,
+            kwargs["batch_size"],
+            kwargs.get("cmp_topk", 0),
+            kwargs["cmp_ratio"],
+            kwargs["ori_mask_mode"],
+            kwargs["cmp_mask_mode"],
+            kwargs["ori_win_left"],
+            kwargs["ori_win_right"],
+            kwargs["has_ori_kv"],
+            kwargs["has_cmp_kv"],
+        )
+
     def _kernel_metadata_from_parts(
         self,
         *,
@@ -1537,20 +1589,34 @@ class DeepseekV4AscendAttnBackend(
         c1a_kwargs = base_kwargs | common
         if self._is_dspark_draft_worker:
             seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
-            max_seqlen_kv = (
-                int(seq_lens_cpu[:bs].max().item())
-                if seq_lens_cpu is not None and bs > 0
-                else int(actual_seq_lengths_kv[:bs].max().item())
-            )
-            c1a_kwargs.update(
-                cu_seqlens_ori_kv=actual_seq_lengths_q_pa,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv,
-            )
-            c1a_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
-                device=str(actual_seq_lengths_kv.device),
-                **c1a_kwargs,
-            )
+            if self._use_host_sparse_metadata:
+                # Host-CPU implementation (sgl-kernel-npu): byte-identical output,
+                # replaces the _C_ascend extra-.so op for the draft worker. Inputs are
+                # CPU int32 seq-lens (seq_lens_cpu_int avoids the D2H where available).
+                cu_q_cpu = actual_seq_lengths_q_pa[: bs + 1].to("cpu", torch.int32)
+                seq_kv_cpu = (
+                    seq_lens_cpu[:bs].int()
+                    if seq_lens_cpu is not None
+                    else actual_seq_lengths_kv[:bs].to("cpu", torch.int32)
+                )
+                c1a_metadata = self._host_sparse_metadata_call(
+                    c1a_kwargs, cu_q_cpu, seq_kv_cpu
+                )
+            else:
+                max_seqlen_kv = (
+                    int(seq_lens_cpu[:bs].max().item())
+                    if seq_lens_cpu is not None and bs > 0
+                    else int(actual_seq_lengths_kv[:bs].max().item())
+                )
+                c1a_kwargs.update(
+                    cu_seqlens_ori_kv=actual_seq_lengths_q_pa,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_kv,
+                )
+                c1a_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+                    device=str(actual_seq_lengths_kv.device),
+                    **c1a_kwargs,
+                )
         else:
             c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
                 **c1a_kwargs,
