@@ -161,7 +161,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
                 device=x.device,
                 dtype=x.dtype,
             )
-        group.cp_all_gather_into_tensor_async(gathered, x, stream)
+        group.all_gather_into_tensor(gathered, x)
 
         chunks = torch.split(gathered, meta.max_rank_len, dim=0)
         trimmed = [

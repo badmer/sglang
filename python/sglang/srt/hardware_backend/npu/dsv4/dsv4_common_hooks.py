@@ -93,12 +93,19 @@ def dsv4_state_payloads(
     *,
     prefix_len: int = 0,
     include_logical_pages: bool = False,
+    transfer_cp_rank: int = 0,
+    transfer_cp_size: int = 1,
 ):
     """Per-StateType PD-payload builders for DSV4-on-NPU.
 
     For chunked prefill, intermediate chunks can leave old C4/C128 state pages in
     the req table. PD only needs the final active tail state; scanning the whole
     prompt span would transfer stale state pages and can perturb decode accuracy.
+
+    When all Prefill CP ranks participate in transfer, each rank exposes the
+    same request-global logical page domain. Split the filtered logical/physical
+    page pairs contiguously so every state page is emitted by exactly one CP rank.
+    The default CP topology keeps the legacy non-CP payload unchanged.
     """
     if not hasattr(req_to_token_pool, "req_to_token_c4"):
         return {}
@@ -110,6 +117,15 @@ def dsv4_state_payloads(
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
+    transfer_cp_rank = int(transfer_cp_rank)
+    transfer_cp_size = int(transfer_cp_size)
+    if transfer_cp_size <= 0:
+        raise ValueError(f"transfer_cp_size must be positive, got {transfer_cp_size}")
+    if not 0 <= transfer_cp_rank < transfer_cp_size:
+        raise ValueError(
+            "transfer_cp_rank must be in "
+            f"[0, {transfer_cp_size}), got {transfer_cp_rank}"
+        )
 
     def empty_pages():
         pages = np.empty((0,), dtype=np.int32)
@@ -140,6 +156,13 @@ def dsv4_state_payloads(
             valid_pages = page_indices > 0
             logical_indices = logical_indices[valid_pages]
             page_indices = page_indices[valid_pages]
+        if transfer_cp_size > 1:
+            total_pages = logical_indices.size
+            base, remainder = divmod(total_pages, transfer_cp_size)
+            local_start = transfer_cp_rank * base + min(transfer_cp_rank, remainder)
+            local_end = local_start + base + (1 if transfer_cp_rank < remainder else 0)
+            logical_indices = logical_indices[local_start:local_end]
+            page_indices = page_indices[local_start:local_end]
         if include_logical_pages:
             return StateIndexMap(
                 logical_indices=logical_indices,
@@ -186,13 +209,19 @@ def dsv4_state_payloads(
             drop_zero_pages=True,
         ),
         AscendStateType.DSV4_C4: lambda: pages(
-            req_to_token_pool.req_to_token_c4, prefix_len // 4, seq_len // 4
+            req_to_token_pool.req_to_token_c4,
+            prefix_len // 4,
+            seq_len // 4,
         ),
         AscendStateType.DSV4_C128: lambda: pages(
-            req_to_token_pool.req_to_token_c128, prefix_len // 128, seq_len // 128
+            req_to_token_pool.req_to_token_c128,
+            prefix_len // 128,
+            seq_len // 128,
         ),
         AscendStateType.DSV4_INDEXER: lambda: pages(
-            req_to_token_pool.req_to_token_c4, prefix_len // 4, seq_len // 4
+            req_to_token_pool.req_to_token_c4,
+            prefix_len // 4,
+            seq_len // 4,
         ),
         AscendStateType.DSV4_C4_STATE: lambda: state_pages(
             req_to_token_pool.req_to_token_c4_state, 4

@@ -113,6 +113,91 @@ class TestDSV4StatePayloadLogicalPages(unittest.TestCase):
         np.testing.assert_array_equal(page_map.logical_indices, np.array([0, 2]))
         np.testing.assert_array_equal(page_map.physical_indices, np.array([1, 3]))
 
+    def test_128k_swa_uses_global_tail_page_during_cp_transfer(self):
+        seq_len = 131072
+        page_size = 128
+        swa_table = torch.zeros((1, seq_len), dtype=torch.int32)
+        swa_table[0, seq_len - page_size] = 7 * page_size
+        req_to_token_pool = SimpleNamespace(
+            req_to_token_c4=torch.zeros((1, 1), dtype=torch.int32),
+            req_to_token_swa=swa_table,
+        )
+
+        payloads = dsv4_state_payloads(
+            req_to_token_pool,
+            req_pool_idx=0,
+            seq_len=seq_len,
+            page_size=page_size,
+            window_size=page_size,
+            include_logical_pages=True,
+            transfer_cp_rank=0,
+            transfer_cp_size=4,
+        )
+        page_map = payloads[AscendStateType.DSV4_SWA]()
+
+        np.testing.assert_array_equal(
+            page_map.logical_indices, np.array([1023], dtype=np.int32)
+        )
+        np.testing.assert_array_equal(
+            page_map.physical_indices, np.array([7], dtype=np.int32)
+        )
+
+    def test_c4_pages_are_partitioned_once_across_four_transfer_cp_ranks(self):
+        seq_len = 131072
+        page_size = 128
+        c4_tokens = seq_len // 4
+        c4_table = torch.zeros((1, c4_tokens), dtype=torch.int32)
+        c4_table[0, ::page_size] = (
+            torch.arange(1, c4_tokens // page_size + 1, dtype=torch.int32) * page_size
+        )
+        req_to_token_pool = SimpleNamespace(
+            req_to_token_c4=c4_table,
+            req_to_token_swa=torch.zeros((1, 1), dtype=torch.int32),
+        )
+
+        page_maps = []
+        for cp_rank in range(4):
+            payloads = dsv4_state_payloads(
+                req_to_token_pool,
+                req_pool_idx=0,
+                seq_len=seq_len,
+                page_size=page_size,
+                window_size=page_size,
+                include_logical_pages=True,
+                transfer_cp_rank=cp_rank,
+                transfer_cp_size=4,
+            )
+            page_maps.append(payloads[AscendStateType.DSV4_C4]())
+
+        combined_logical = np.concatenate(
+            [page_map.logical_indices for page_map in page_maps]
+        )
+        combined_physical = np.concatenate(
+            [page_map.physical_indices for page_map in page_maps]
+        )
+        np.testing.assert_array_equal(combined_logical, np.arange(256, dtype=np.int32))
+        np.testing.assert_array_equal(
+            combined_physical, np.arange(1, 257, dtype=np.int32)
+        )
+
+    def test_rejects_invalid_transfer_cp_topology(self):
+        req_to_token_pool = SimpleNamespace(
+            req_to_token_c4=torch.zeros((1, 1), dtype=torch.int32),
+        )
+
+        for cp_rank, cp_size in ((0, 0), (-1, 4), (4, 4)):
+            with self.subTest(cp_rank=cp_rank, cp_size=cp_size):
+                with self.assertRaises(ValueError):
+                    dsv4_state_payloads(
+                        req_to_token_pool,
+                        req_pool_idx=0,
+                        seq_len=1,
+                        page_size=128,
+                        window_size=128,
+                        transfer_cp_rank=cp_rank,
+                        transfer_cp_size=cp_size,
+                    )
+
 
 class TestMooncakeStateMapWire(unittest.TestCase):
     def test_metadata_encoder_keeps_legacy_and_logical_state_entries_parallel(self):

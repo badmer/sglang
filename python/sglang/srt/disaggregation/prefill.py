@@ -1210,6 +1210,8 @@ class SchedulerDisaggregationPrefillMixin:
                         self.sliding_window_size,
                         prefix_len=0,
                         include_logical_pages=True,
+                        transfer_cp_rank=self.ps.attn_cp_rank,
+                        transfer_cp_size=self.ps.attn_cp_size,
                     )
                 )
             state_indices = [
