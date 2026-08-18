@@ -163,23 +163,34 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             )
         group.all_gather_into_tensor(gathered, x)
 
+        total = int(meta.total_seq_lens)
+        if total == 0:
+            return gathered[:0]
+
+        per_rank = meta.per_rank_actual_token
+        if all(int(n) == int(per_rank[0]) for n in per_rank):
+            # Equal per-rank lengths: one interleave copy restores the
+            # original token order (out[i*cp + r] = rank r's i-th token).
+            return (
+                gathered.view(self.cp_size, int(per_rank[0]), *x.shape[1:])
+                .transpose(0, 1)
+                .reshape(int(per_rank[0]) * self.cp_size, *x.shape[1:])
+            )
+
         chunks = torch.split(gathered, meta.max_rank_len, dim=0)
         trimmed = [
             chunks[rank][:per_rank_len]
-            for rank, per_rank_len in enumerate(meta.per_rank_actual_token)
+            for rank, per_rank_len in enumerate(per_rank)
         ]
         if not trimmed:
             return x.new_empty((0, *x.shape[1:]))
         flat = torch.cat(trimmed, dim=0)
-        total = int(meta.total_seq_lens)
-        if total == 0:
-            return flat[:0]
 
         logical = torch.arange(total, device=x.device, dtype=torch.long)
         rank_ids = logical % self.cp_size
         rank_offsets = logical // self.cp_size
         prefix = [0]
-        for n in meta.per_rank_actual_token[:-1]:
+        for n in per_rank[:-1]:
             prefix.append(prefix[-1] + int(n))
         prefix_tensor = torch.tensor(prefix, device=x.device, dtype=torch.long)
         source = prefix_tensor[rank_ids] + rank_offsets

@@ -257,6 +257,13 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         state_last_loc = get_last_loc(
             state_table, req_pool_indices, raw_prefix_lens
         ).to(last_loc_dtype)
+        # Radix reuse leaves the state row unwritten (0) below the tail;
+        # map 0 to the "fresh" sentinel -1 instead of a bogus anchor.
+        state_last_loc = torch.where(
+            state_last_loc <= 0,
+            torch.full_like(state_last_loc, -1),
+            state_last_loc,
+        )
 
         result = allocator.alloc_extend(
             state_prefix_lens,
@@ -282,6 +289,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         req_pool_indices: torch.Tensor,
         last_loc_dtype: torch.dtype,
         ratio: int,
+        unwritten_candidates: Optional[List[bool]] = None,
     ) -> torch.Tensor:
         """Allocate compressed-KV slots for an extend at ``ratio``.
 
@@ -310,6 +318,33 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c_last_loc = get_last_loc(c_table, req_pool_indices, c_prefix).to(
             last_loc_dtype
         )
+        c_skip_invariant = None
+        if unwritten_candidates is None or any(unwritten_candidates):
+            # Radix reuse leaves the c-table row unwritten (0) below the tail;
+            # map 0 to the "fresh" sentinel so the allocator cannot continue
+            # from slot 1 and overlap live slots.
+            unwritten = c_last_loc <= 0
+            c_last_loc = torch.where(
+                unwritten,
+                torch.full_like(c_last_loc, -1),
+                c_last_loc,
+            )
+            # Unaligned unwritten prefixes have no valid predecessor slot:
+            # anchor at a reserved fresh page's base (freed fully, no leak).
+            ps = allocator.page_size
+            needs_anchor = unwritten & (c_prefix % ps != 0)
+            k = int(needs_anchor.sum().item()) if needs_anchor.numel() else 0
+            if k > 0:
+                if allocator.need_sort and len(allocator.free_pages) < k:
+                    allocator.merge_and_sort_free()
+                if len(allocator.free_pages) < k:
+                    return None
+                anchor_pages = allocator.free_pages[:k]
+                allocator.free_pages = allocator.free_pages[k:]
+                c_last_loc[needs_anchor] = (
+                    anchor_pages.to(c_last_loc.dtype) * ps - 1
+                )
+                c_skip_invariant = needs_anchor
 
         result = allocator.alloc_extend(
             c_prefix,
@@ -318,6 +353,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             seq_lens_cpu // ratio,
             c_last_loc,
             c_extend,
+            skip_invariant_check=c_skip_invariant,
         )
         if result is None:
             raise self._pool_exhausted(
@@ -376,6 +412,11 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         else:
             out_c4_state_loc = self._empty_loc
             out_c128_state_loc = self._empty_loc
+        c_unwritten = (
+            None
+            if dsv4_state_lens is None
+            else dsv4_state_lens.c_unwritten_candidates
+        )
         out_c4_loc = self._alloc_c_extend(
             self.c4_attn_allocator,
             prefix_lens,
@@ -385,6 +426,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             req_pool_indices,
             last_loc_dtype,
             ratio=4,
+            unwritten_candidates=c_unwritten,
         )
         out_c128_loc = self._alloc_c_extend(
             self.c128_attn_allocator,
@@ -395,6 +437,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             req_pool_indices,
             last_loc_dtype,
             ratio=128,
+            unwritten_candidates=c_unwritten,
         )
         return DSV4OutCacheLoc(
             out_full_loc=out_full_loc,
@@ -467,6 +510,14 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             req.c4_state_write_offset = seq_len - c4_count
             req.c128_state_write_offset = seq_len - c128_count
 
+        # CPU superset of rows whose c-table is unwritten at the boundary
+        # (radix reuse); lets the allocator skip the check and its sync.
+        c_unwritten_candidates = [
+            prefix_len > 0
+            and (req.kv is None or req.kv.kv_allocated_len < prefix_len)
+            for req, prefix_len in zip(reqs, prefix_lens)
+        ]
+
         return self._pack_state_lens(
             c4_prefix,
             c4_seq,
@@ -476,6 +527,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             c128_extend_num_tokens=int(
                 sum(s - p for s, p in zip(c128_seq, c128_prefix))
             ),
+            c_unwritten_candidates=c_unwritten_candidates,
         )
 
     def compute_dsv4_state_lens_decode(
@@ -509,6 +561,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             c128_seq,
             c4_extend_num_tokens=bs,
             c128_extend_num_tokens=bs,
+            # Decode rows always have written c-tables; skip the anchor check.
+            c_unwritten_candidates=[False] * bs,
         )
 
     def compute_dsv4_state_lens_reserve(
@@ -552,6 +606,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         *,
         c4_extend_num_tokens: int,
         c128_extend_num_tokens: int,
+        c_unwritten_candidates: Optional[List[bool]] = None,
     ) -> DSV4StateLens:
         c4_prefix_cpu = torch.tensor(c4_prefix, dtype=torch.int64)
         c4_seq_cpu = torch.tensor(c4_seq, dtype=torch.int64)
@@ -568,6 +623,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             c128_seq_lens=c128_seq_cpu.to(self.device, non_blocking=True),
             c128_seq_lens_cpu=c128_seq_cpu,
             c128_extend_num_tokens=c128_extend_num_tokens,
+            c_unwritten_candidates=c_unwritten_candidates,
         )
 
     def alloc_extend(
@@ -769,12 +825,16 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         ):
             if allocator is None or not hasattr(req_to_token_pool, table_attr):
                 continue
+            table = getattr(req_to_token_pool, table_attr)
             off = getattr(req, off_attr, 0)
             if kv_len > off:
-                slots = getattr(req_to_token_pool, table_attr)[req_pool_idx, off:kv_len]
+                slots = table[req_pool_idx, off:kv_len]
                 slots = slots[slots > 0]
                 if slots.numel() > 0:
                     allocator.free(slots.to(torch.int64))
+                # Zero freed entries so a reused req slot exposes no stale
+                # slot ids to later last_loc lookups or free passes.
+                table[req_pool_idx, off:kv_len] = 0
 
     def clear(self):
         super().clear()

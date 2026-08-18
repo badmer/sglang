@@ -617,8 +617,11 @@ def _free_state_range(
     offset = getattr(req, offset_attr, 0)
     if state_allocator is None or not hasattr(pool, table_attr) or watermark <= offset:
         return
-    free_slots = getattr(pool, table_attr)[req.req_pool_idx, offset:watermark]
+    table = getattr(pool, table_attr)
+    free_slots = table[req.req_pool_idx, offset:watermark]
     free_slots = free_slots[free_slots > 0]
     if free_slots.numel() > 0:
         state_allocator.free(free_slots.to(torch.int64))
+    # Zero freed entries so a reused req slot exposes no stale slot ids.
+    table[req.req_pool_idx, offset:watermark] = 0
     setattr(req, offset_attr, watermark)

@@ -335,6 +335,9 @@ class DSV4StateLens:
     c128_seq_lens: torch.Tensor
     c128_seq_lens_cpu: torch.Tensor
     c128_extend_num_tokens: int
+    # Per-req CPU flag: c-table rows may be unwritten at this prefix boundary
+    # (radix reuse); gates the allocator's anchor check. None = always check.
+    c_unwritten_candidates: Optional[List[bool]] = None
 
 
 @dataclass
