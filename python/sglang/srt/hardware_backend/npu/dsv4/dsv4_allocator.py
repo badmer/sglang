@@ -257,10 +257,13 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         state_last_loc = get_last_loc(
             state_table, req_pool_indices, raw_prefix_lens
         ).to(last_loc_dtype)
-        # Radix reuse leaves the state row unwritten (0) below the tail;
-        # map 0 to the "fresh" sentinel -1 instead of a bogus anchor.
+        # No valid predecessor: unwritten (0) or stale foreign slot id from a
+        # recycled req slot; map both to the "fresh" sentinel -1.
+        invalid = (state_last_loc <= 0) | (
+            (state_last_loc + 1) % allocator.page_size != state_prefix_lens % allocator.page_size
+        )
         state_last_loc = torch.where(
-            state_last_loc <= 0,
+            invalid,
             torch.full_like(state_last_loc, -1),
             state_last_loc,
         )
@@ -318,21 +321,22 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c_last_loc = get_last_loc(c_table, req_pool_indices, c_prefix).to(
             last_loc_dtype
         )
-        c_skip_invariant = None
         if unwritten_candidates is None or any(unwritten_candidates):
-            # Radix reuse leaves the c-table row unwritten (0) below the tail;
-            # map 0 to the "fresh" sentinel so the allocator cannot continue
-            # from slot 1 and overlap live slots.
-            unwritten = c_last_loc <= 0
+            # No valid predecessor: unwritten (0, radix reuse) or a stale
+            # foreign slot id from a recycled req slot - both would continue
+            # the allocator from a bogus anchor.
+            ps = allocator.page_size
+            invalid = (c_last_loc <= 0) | (
+                (c_last_loc + 1) % ps != c_prefix % ps
+            )
             c_last_loc = torch.where(
-                unwritten,
+                invalid,
                 torch.full_like(c_last_loc, -1),
                 c_last_loc,
             )
-            # Unaligned unwritten prefixes have no valid predecessor slot:
-            # anchor at a reserved fresh page's base (freed fully, no leak).
-            ps = allocator.page_size
-            needs_anchor = unwritten & (c_prefix % ps != 0)
+            # Unaligned invalid prefixes anchor at a fresh page's own in-page
+            # offset so slot(p) == p (mod ps) holds for every anchored position.
+            needs_anchor = invalid & (c_prefix % ps != 0)
             k = int(needs_anchor.sum().item()) if needs_anchor.numel() else 0
             if k > 0:
                 if allocator.need_sort and len(allocator.free_pages) < k:
@@ -341,10 +345,10 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                     return None
                 anchor_pages = allocator.free_pages[:k]
                 allocator.free_pages = allocator.free_pages[k:]
+                r = (c_prefix % ps)[needs_anchor].to(c_last_loc.dtype)
                 c_last_loc[needs_anchor] = (
-                    anchor_pages.to(c_last_loc.dtype) * ps - 1
+                    anchor_pages.to(c_last_loc.dtype) * ps + r - 1
                 )
-                c_skip_invariant = needs_anchor
 
         result = allocator.alloc_extend(
             c_prefix,
@@ -353,7 +357,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             seq_lens_cpu // ratio,
             c_last_loc,
             c_extend,
-            skip_invariant_check=c_skip_invariant,
         )
         if result is None:
             raise self._pool_exhausted(
@@ -802,11 +805,15 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         ):
             n = kv_len // ratio
             if n > 0 and hasattr(req_to_token_pool, table_attr):
-                slots = getattr(req_to_token_pool, table_attr)[req_pool_idx, :n]
+                table = getattr(req_to_token_pool, table_attr)
+                slots = table[req_pool_idx, :n]
                 slots = slots[slots > 0]
                 # to int64 — paged allocator's free does cpu()//page_size on it.
                 if slots.numel() > 0:
                     allocator.free(slots.to(torch.int64))
+                # Zero the row so a recycled req slot never exposes stale
+                # slot ids to the next occupant's last_loc lookup.
+                table[req_pool_idx, :n] = 0
 
         # State pools: free only the tail [c{N}_state_alloc_offset, kv_len).
         for ratio, allocator, table_attr, off_attr in (
