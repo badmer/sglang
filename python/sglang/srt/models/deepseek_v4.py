@@ -1315,7 +1315,11 @@ class MQALayer(MqaAttentionBase):
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
-        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        use_cp = (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)) or (
+            getattr(forward_batch, "attn_cp_metadata", None) is not None
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and get_parallel().attn_cp_size > 1
+        )
         kv: Optional[torch.Tensor]
         kv_handle = None
 
@@ -1452,9 +1456,17 @@ class MQALayer(MqaAttentionBase):
                 sin4,
                 qk_nope_dim=self.qk_nope_head_dim,
             )
+            kv_for_cache = kv
+            if use_cp:
+                kv_for_cache = cp_all_gather_rerange_output(
+                    kv.contiguous(),
+                    get_parallel().attn_cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
-                swa_k=kv,
+                swa_k=kv_for_cache,
                 forward_batch=forward_batch,
             )
             kv = None
@@ -1512,20 +1524,48 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
+        use_npu_cp_full_metadata = (
+            use_cp and _is_npu and hasattr(attn_backend, "use_dsv4_cp_full_metadata")
+        )
         if self.indexer is not None:
-            self.indexer(
-                x=x,
-                q_lora=q_lora,
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-            )
+            if use_npu_cp_full_metadata:
+                with attn_backend.use_dsv4_cp_full_metadata(forward_batch):
+                    attn_backend.forward_indexer_compressor(
+                        x,
+                        forward_batch,
+                        self.indexer.layer_id,
+                        self.indexer.compressor,
+                    )
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                    skip_compressor=True,
+                )
+            else:
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                )
         if self.compressor is not None:
-            attn_backend.forward_core_compressor(
-                x,
-                forward_batch,
-                self.layer_id,
-                self.compressor,
-            )
+            if use_npu_cp_full_metadata:
+                with attn_backend.use_dsv4_cp_full_metadata(forward_batch):
+                    attn_backend.forward_core_compressor(
+                        x,
+                        forward_batch,
+                        self.layer_id,
+                        self.compressor,
+                    )
+            else:
+                attn_backend.forward_core_compressor(
+                    x,
+                    forward_batch,
+                    self.layer_id,
+                    self.compressor,
+                )
 
         if _is_hip and kv_handle is not None:
             kv = cp_all_gather_rerange_finish(kv_handle)
@@ -3114,6 +3154,25 @@ class DeepseekV4Model(nn.Module):
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
                 input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
+        elif (
+            getattr(forward_batch, "attn_cp_metadata", None) is not None
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and get_parallel().attn_cp_size > 1
+        ):
+            input_ids = cp_split_and_rebuild_data(forward_batch, input_ids)
+            input_ids_global = input_ids
+
+        attn_backend = get_attn_backend()
+        if getattr(forward_batch, "attn_cp_metadata", None) is not None and hasattr(
+            attn_backend, "prepare_dsv4_cp_metadata"
+        ):
+            attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+            local_positions = getattr(forward_batch, "dsv4_cp_local_positions", None)
+            if (
+                local_positions is not None
+                and positions.shape[0] == local_positions.shape[0]
+            ):
+                forward_batch.positions = positions
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
@@ -3339,13 +3398,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                     forward_batch.seq_lens_cpu.tolist(),
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
-                if is_dsa_prefill_cp_round_robin_split():
-                    attn_backend = get_attn_backend()
+                attn_backend = get_attn_backend()
+                if hasattr(attn_backend, "prepare_dsv4_cp_metadata"):
+                    attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+                elif is_dsa_prefill_cp_round_robin_split():
                     metadata = attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related(is_prefill=True)
-                    if metadata.indexer_metadata is not None:
+                    core_meta = getattr(metadata, "core_attn_metadata", None)
+                    if core_meta is not None:
+                        core_meta.apply_cp_reindex()
+                        core_meta.init_flashmla_related(is_prefill=True)
+                    if (
+                        core_meta is not None
+                        and getattr(metadata, "indexer_metadata", None) is not None
+                    ):
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
