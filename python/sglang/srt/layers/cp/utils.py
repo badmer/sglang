@@ -57,15 +57,22 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     """Whether DSA GPU KV/indexer cache layers are sharded across CP ranks.
 
     Layer split is a prefill-CP-only optimization for DSA (DeepSeek Sparse
-    Attention) MLA models (e.g. GLM-5.2). Draft workers keep the full cache.
+    Attention) models: the MLA DSA family (e.g. GLM-5.2) and DeepSeek V4,
+    whose attention arch is MHA but whose pools are still DSA-style per-layer
+    caches. Draft workers keep the full cache.
     """
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
+    hf_config = model_runner.model_config.hf_config
     return (
         not model_runner.is_draft_worker
         and get_parallel().config.enable_dsa_cache_layer_split
-        and model_runner.use_mla_backend
-        and is_deepseek_dsa(model_runner.model_config.hf_config)
+        and (
+            # V4 is AttentionArch.MHA, so the MLA backend term only gates the
+            # MLA DSA family.
+            (model_runner.use_mla_backend and is_deepseek_dsa(hf_config))
+            or is_deepseek_v4(hf_config)
+        )
     )
 
 
