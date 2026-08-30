@@ -619,6 +619,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         eps: float,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         kv_out = torch_npu.npu_rms_norm(kv, kv_weight, eps)[0]
 
@@ -626,13 +628,20 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
         from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
-        cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
-            positions,
-            kv_out.dtype,
-            view_4d=True,
-            allow_build=True,
-            cache_dtype=torch.float32,
-        )
+        if cos_sin is not None:
+            # Caller gathered bf16 cos/sin through the per-forward memo
+            # (rope_cos_sin): skips this layer's fp32 gather + cast pair.
+            # Bit-identical: rounding the table once equals rounding each
+            # gathered element.
+            cos, sin = cos_sin
+        else:
+            cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
+                positions,
+                kv_out.dtype,
+                view_4d=True,
+                allow_build=True,
+                cache_dtype=torch.float32,
+            )
         Dsv4NpuRoPE.apply_rotary_mul_inplace(
             kv_out.reshape(kv_out.shape[0], -1, kv_out.shape[-1]),
             None,

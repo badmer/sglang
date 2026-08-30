@@ -223,6 +223,7 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+_NPU_ROPE_MEMO_LOGGED = False
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -771,6 +772,13 @@ class MqaAttentionBase(nn.Module):
     def _local_attn_sink(self) -> torch.Tensor:
         if self.attn_tp_size == 1:
             return self.attn_sink
+        if _is_npu:
+            # No head padding on NPU (see forward): slice the rank's heads.
+            return self.attn_sink[
+                self.attn_tp_rank
+                * self.n_local_heads : (self.attn_tp_rank + 1)
+                * self.n_local_heads
+            ]
         if self._attn_sink_local is None:
             rank = self.attn_tp_rank
             num_heads = self.n_local_heads
@@ -863,6 +871,16 @@ class MQALayer(MqaAttentionBase):
                 torch.ones(self.head_dim, dtype=torch.bfloat16),
                 persistent=False,
             )
+            # Deployment marker: absence of this line in the serving log means
+            # the process is not running this rope-memo code path.
+            global _NPU_ROPE_MEMO_LOGGED
+            if not _NPU_ROPE_MEMO_LOGGED:
+                _NPU_ROPE_MEMO_LOGGED = True
+                log_info_on_rank0(
+                    logger,
+                    "DSV4 NPU rope: bf16 tables + per-forward cos/sin memo "
+                    "active (per-layer gather/cast/neg eliminated)",
+                )
 
         if _is_hip:
             cos_cache = (
@@ -1013,6 +1031,8 @@ class MQALayer(MqaAttentionBase):
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        # kv_out keeps kv's dtype (npu_rms_norm does not promote), so the
+        # memoized bf16 gather serves this path cast-free.
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
             swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
@@ -1021,6 +1041,13 @@ class MQALayer(MqaAttentionBase):
             eps=self.eps,
             freqs_cis=self.freqs_cis,
             positions=positions,
+            cos_sin=rope_cos_sin(
+                self.freqs_cis,
+                getattr(self, "rotary_emb", None),
+                forward_batch,
+                positions,
+                kv.dtype,
+            ),
         )
 
     def _compute_kv_bf16(
@@ -1637,7 +1664,14 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.attn_tp_size > 1:
+        # NPU skips the head padding: the Ascend sparse-attn kernel takes the
+        # true per-rank head count from its metadata, and the padded path
+        # costs a per-layer [T, n_local_heads, head_dim] copy, doubles the
+        # attention output write, and -- decisively -- hands the output rope
+        # a STRIDED o[:, :n_local_heads, :], which forces
+        # inplace_partial_rotary_mul onto its non-fused fallback (the
+        # per-layer gather/neg/cast cluster in profiles).
+        if self.attn_tp_size > 1 and not _is_npu:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to

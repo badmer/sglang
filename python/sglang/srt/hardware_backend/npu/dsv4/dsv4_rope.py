@@ -8,9 +8,71 @@ mscale: cos/sin stored in freqs_cis must already be pre-multiplied by the YARN
 mscale at precompute time (see precompute_freqs_cis). We just read what's stored.
 """
 
+import logging
+import sys
+import traceback
 from typing import Optional
 
 import torch
+
+# Temporary debug instrumentation for the rope-memo verification; remove
+# afterwards. WARNING level so it survives log-level filtering:
+#   [rope PRIME] per-forward prime marker: module count, forward_batch id,
+#                mode/spec class, positions tensor id, primed freqs_cis ids
+#   [rope MISS]  every memo miss, with the reason and the sglang call chain
+#   [rotary]     rotary launches tagged with cos/sin tensor ids + call chain,
+#                so profile kernels can be bound to Python call sites; shared
+#                memo entries show up as repeated identical id pairs
+#   [rope CMP]   the compressor's direct get_cos_sin (bypasses the memo),
+#                counted so profile gathers can be attributed to it
+_MISS_N = 0
+_PRIME_N = 0
+_ROTARY_N = 0
+_CMP_N = 0
+_GCS_N = 0
+_GCS_SITES: dict[str, int] = {}
+_MEMO_LOG = logging.getLogger(__name__)
+
+
+def _sglang_call_sites(depth: int = 4) -> str:
+    frames = [f for f in traceback.extract_stack() if "sglang" in (f.filename or "")]
+    frames = frames[-depth:]
+    return " <- ".join(
+        f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno}:{f.name}" for f in frames
+    )
+
+
+def _fb_tag(forward_batch) -> str:
+    # "fb-id/spec-class": EAGLE draft forwards are told apart from target
+    # verify / plain decode by the spec_info subclass carried on the batch.
+    spec = forward_batch.spec_info
+    return f"{id(forward_batch)}/{type(spec).__name__ if spec is not None else 'nospec'}"
+
+
+# Temporary diagnostics for the per-forward rope memo, classified so one log
+# line identifies WHY a lookup missed: prime never ran on this forward_batch
+# (miss_no_memo), dtype/config key mismatch (miss_key), or the positions
+# object differs from the primed one (miss_positions). Remove once deployment
+# is verified.
+
+
+def _note_gcs_call(dtype, cache_dtype, inverse: bool) -> None:
+    # Temporary: count EVERY get_cos_sin invocation by its (out-of-module)
+    # callsite with exact totals, dumped periodically. Unlike the sampled
+    # MISS/CMP/rotary lines this is exhaustive, so any surviving per-layer
+    # gather path shows up with its true count. sys._getframe is ~us; the
+    # internal wrappers (prime/rope_cos_sin/cmp_cos_sin) are skipped so the
+    # site is the model/backend code that originated the gather.
+    global _GCS_N
+    _GCS_N += 1
+    f = sys._getframe(2)
+    if f.f_code.co_filename == __file__:
+        f = sys._getframe(3)
+    site = f"{f.f_code.co_filename.rsplit('/', 1)[-1]}:{f.f_lineno}"
+    key = f"{site}|d={str(dtype).replace('torch.', '')},c={str(cache_dtype).replace('torch.', '')},inv={int(inverse)}"
+    _GCS_SITES[key] = _GCS_SITES.get(key, 0) + 1
+    if _GCS_N % 1000 == 0:
+        _MEMO_LOG.warning("[rope GCS total=%d] %s", _GCS_N, _GCS_SITES)
 
 
 class Dsv4NpuRoPE:
@@ -133,6 +195,7 @@ class Dsv4NpuRoPE:
         # positions: [T]. Returns [T, rope_dim], or [T, 1, 1, rope_dim] if view_4d.
         # Position-gathered tensors are forward-local; do not cache across forwards
         # or MTP decode reuses the previous step's RoPE when only positions change.
+        _note_gcs_call(dtype, cache_dtype or dtype, inverse)
         cache_dtype = dtype if cache_dtype is None else cache_dtype
         cos_cache, sin_cache = self.ensure_tables(cache_dtype, allow_build=allow_build)
         cos = cos_cache.index_select(0, positions)
@@ -159,6 +222,21 @@ class Dsv4NpuRoPE:
         # q_rope: [T, n_heads, head_dim]; cos4/sin4: [T, 1, 1, rope_dim];
         # kv_rope: [T, 1, head_dim] or None. Prefer the NPU kernel: torch accumulates
         # bf16 muls in bf16 while the kernel uses fp32; drift compounds and flips argmax.
+        global _ROTARY_N
+        if q_rope.numel() == 0:
+            # Idle/empty forward: skip the empty kernel launch too.
+            return
+        _ROTARY_N += 1
+        if _ROTARY_N <= 40 or _ROTARY_N % 200 == 0:
+            _MEMO_LOG.warning(
+                "[rotary #%d]%s q%s cos_id=%d sin_id=%d at %s",
+                _ROTARY_N,
+                "+kv" if kv_rope is not None else "",
+                tuple(q_rope.shape),
+                id(cos4),
+                id(sin4),
+                _sglang_call_sites(),
+            )
         rope_dim = cos4.shape[-1]
         torch.ops.custom.inplace_partial_rotary_mul(
             q_rope.unsqueeze(1),
@@ -184,9 +262,22 @@ class Dsv4NpuRoPE:
 # Per-forward memo of position-gathered (cos, sin), stashed on the ForwardBatch
 # under this attribute by prime_rope_cos_sin (the single writer).
 _ROPE_MEMO_ATTR = "_dsv4_npu_rope_memo"
+_CMP_MEMO_ATTR = "_dsv4_npu_rope_cmp_memo"
 
 
 def prime_rope_cos_sin(attn_modules, forward_batch, positions) -> None:
+    # Materialize: callers may pass a generator, and the debug log below must
+    # not consume it before the priming loop (that bug left the memo empty and
+    # every lookup fell to the per-layer fallback path).
+    attn_modules = list(attn_modules)
+    if forward_batch.forward_mode.is_idle():
+        # Idle draft forwards still run the (zero-token) layer loop, so keep
+        # empty memos for the lookups -- every gather here is a no-op launch
+        # (57% of D-node primes under PD were idle; layer lookups hit the
+        # numel==0 fast path in rope_cos_sin).
+        setattr(forward_batch, _ROPE_MEMO_ATTR, {})
+        setattr(forward_batch, _CMP_MEMO_ATTR, {})
+        return
     memo: dict = {}
     for attn in attn_modules:
         freqs_cis = attn.freqs_cis
@@ -206,6 +297,41 @@ def prime_rope_cos_sin(attn_modules, forward_batch, positions) -> None:
         memo[fwd_key] = (positions, cos, sin)
         memo[(id(freqs_cis), torch.bfloat16, True)] = (positions, cos, -sin)
     setattr(forward_batch, _ROPE_MEMO_ATTR, memo)
+    # Compressor gathers (cmp_cos_sin) share this forward's lifecycle: prime
+    # is the single writer that clears them, so a reused ForwardBatch (EAGLE
+    # draft loop) can never serve a stale gather even when the cmp-positions
+    # tensor object is reused.
+    setattr(forward_batch, _CMP_MEMO_ATTR, {})
+    global _PRIME_N
+    _PRIME_N += 1
+    # One line per forward is cheap and the entries' tensor ids are what the
+    # parser matches rotary cos_ids against -- sparse sampling here would make
+    # most rotary lines look unmatched. Dense for the first 5000 forwards,
+    # then thin out.
+    if _PRIME_N <= 5000 or _PRIME_N % 200 == 0:
+        # entries carries every gathered tensor id (per freqs: cos/sin of the
+        # forward pair, inv_s of the derived inverse pair) so rotary lines can
+        # be matched back to their prime -- an unmatched rotary cos_id means a
+        # gather outside the memo.
+        entries = sorted(
+            (
+                f"f{k[0]}/c{id(v[1])}/s{id(v[2])}"
+                if not k[2]
+                else f"f{k[0]}/inv_s{id(v[2])}"
+            )
+            for k, v in memo.items()
+        )
+        _MEMO_LOG.warning(
+            "[rope PRIME #%d] modules=%d fb=%s mode=%s bs=%s positions_id=%d "
+            "entries=%s",
+            _PRIME_N,
+            len(attn_modules),
+            _fb_tag(forward_batch),
+            forward_batch.forward_mode.name,
+            forward_batch.batch_size,
+            id(positions),
+            entries,
+        )
 
 
 def rope_cos_sin(
@@ -217,10 +343,41 @@ def rope_cos_sin(
     *,
     inverse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if positions.numel() == 0 or forward_batch.forward_mode.is_idle():
+        # Idle/empty forwards run a (possibly padded) layer loop whose output
+        # is discarded: hand back uninitialized tensors instead of gathering.
+        # numel==0 covers empty-token forwards (draft idle); is_idle covers
+        # DP-padded idle forwards whose positions are non-empty -- those
+        # would otherwise miss the empty prime memo and gather per layer.
+        rope_dim = freqs_cis.shape[-1] * 2
+        empty = positions.new_empty((positions.shape[0], 1, 1, rope_dim), dtype=dtype)
+        return empty, empty
     memo = getattr(forward_batch, _ROPE_MEMO_ATTR, None)
     entry = memo.get((id(freqs_cis), dtype, inverse)) if memo is not None else None
     if entry is not None and entry[0] is positions:
         return entry[1], entry[2]
+    global _MISS_N
+    _MISS_N += 1
+    if _MISS_N <= 20 or _MISS_N % 500 == 0:
+        if memo is None:
+            reason = "no_memo_on_forward_batch"
+        elif entry is None:
+            reason = f"key_not_found(dtype={dtype},inverse={inverse})"
+        else:
+            reason = "positions_object_mismatch"
+        _MEMO_LOG.warning(
+            "[rope MISS #%d] %s fb=%s mode=%s freqs_id=%d positions_id=%d "
+            "primed_freqs=%s primed_positions=%s at %s",
+            _MISS_N,
+            reason,
+            _fb_tag(forward_batch),
+            forward_batch.forward_mode.name,
+            id(freqs_cis),
+            id(positions),
+            sorted({k[0] for k in memo}) if memo is not None else None,
+            {k: id(v[0]) for k, v in memo.items()} if memo is not None else None,
+            _sglang_call_sites(),
+        )
     # bf16 tables are ensured at layer init; gathering in the activation dtype
     # skips the fp32-gather + cast pair. Bit-identical values: rounding the
     # table once equals rounding each gathered element.
@@ -233,3 +390,63 @@ def rope_cos_sin(
         allow_build=False,
         cache_dtype=cache_dtype,
     )
+
+
+def note_cmp_gather(ratio: int, positions, cos, sin, cached: bool, mode: str) -> None:
+    # Temporary: the compressor's forward_compress gathers cos/sin directly
+    # (own positions, fp32); count hits vs misses so the cmp-memo effect is
+    # measurable in the serving log, split by forward mode.
+    global _CMP_N
+    _CMP_N += 1
+    if _CMP_N <= 40 or _CMP_N % 500 == 0:
+        _MEMO_LOG.warning(
+            "[rope CMP #%d] ratio=%d cached=%s mode=%s positions_id=%d cos_id=%d "
+            "sin_id=%d at %s",
+            _CMP_N,
+            ratio,
+            "hit" if cached else "miss",
+            mode,
+            id(positions),
+            id(cos),
+            id(sin),
+            _sglang_call_sites(),
+        )
+
+
+def cmp_cos_sin(
+    freqs_cis: torch.Tensor,
+    rotary_emb,
+    forward_batch,
+    ratio: int,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    # The compressor path gathers over fm.positions_cmp_padding_c{ratio} in
+    # fp32; one gather per (freqs_cis, ratio) per forward, shared by every
+    # layer's compressor and the indexer's inner compressor. The memo dict is
+    # created/cleared only by prime_rope_cos_sin: when prime did not run
+    # (TBO children) fall back to a per-layer gather rather than risk caching
+    # across forward boundaries. Third return value: whether the memo hit.
+    memo = getattr(forward_batch, _CMP_MEMO_ATTR, None)
+    if positions.numel() == 0:
+        empty = positions.new_empty((0, freqs_cis.shape[-1] * 2), dtype=torch.float32)
+        return empty, empty, False
+    if memo is None:
+        cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis, rotary_emb).get_cos_sin(
+            positions,
+            torch.float32,
+            view_4d=False,
+            allow_build=False,
+        )
+        return cos, sin, False
+    key = (id(freqs_cis), ratio)
+    entry = memo.get(key)
+    if entry is not None and entry[0] is positions:
+        return entry[1], entry[2], True
+    cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis, rotary_emb).get_cos_sin(
+        positions,
+        torch.float32,
+        view_4d=False,
+        allow_build=False,
+    )
+    memo[key] = (positions, cos, sin)
+    return cos, sin, False

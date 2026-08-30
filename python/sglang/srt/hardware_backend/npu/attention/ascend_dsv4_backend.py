@@ -17,7 +17,12 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+    Dsv4NpuRoPE,
+    cmp_cos_sin,
+    note_cmp_gather,
+    rope_cos_sin,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
@@ -468,13 +473,21 @@ class CompressorAscendBackendMixin:
             state_block_table = table_cache[ratio]
             cache_mode = 2
 
-        cos, sin = Dsv4NpuRoPE.for_freqs(
-            compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
-        ).get_cos_sin(
-            getattr(fm, f"positions_cmp_padding_c{ratio}"),
-            torch.float32,
-            view_4d=False,
-            allow_build=False,
+        cmp_positions = getattr(fm, f"positions_cmp_padding_c{ratio}")
+        cos, sin, cmp_cached = cmp_cos_sin(
+            compressor.freqs_cis,
+            getattr(compressor, "rotary_emb", None),
+            forward_batch,
+            ratio,
+            cmp_positions,
+        )
+        note_cmp_gather(
+            ratio,
+            cmp_positions,
+            cos,
+            sin,
+            cached=cmp_cached,
+            mode=forward_batch.forward_mode.name,
         )
 
         # TODO: torch.ops.npu.compressor does not support Atlas A5 yet.
@@ -2142,6 +2155,23 @@ class DeepseekV4AscendAttnBackend(
         # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
         # already pass expanded lengths and are not incremented again.
         verify_seq_lens_cpu = fm.seq_lens_cpu_int[:bs]
+        # Final lengths turn an idle/padding row (live 0) into n_draft, which
+        # defeats the live>0 exclusion in the boundary mask: the row's
+        # padding position 0 gets selected and 0 + (1 - ratio) goes negative,
+        # crashing the compressor rope gather ("Index -3 out of range").
+        # Keep live-0 rows at 0, matching the graph path's guard in
+        # _refresh_graph_target_verify_compress_1d_direct.
+        live_cpu = (
+            forward_batch.seq_lens_cpu[:bs]
+            if forward_batch.seq_lens_cpu is not None
+            else None
+        )
+        if live_cpu is not None:
+            verify_seq_lens_cpu = torch.where(
+                live_cpu > 0,
+                verify_seq_lens_cpu,
+                torch.zeros_like(verify_seq_lens_cpu),
+            )
         padding_sizes = {}
         for ratio in (4, 128):
             if ratio not in self._dsv4_compress_ratios:
@@ -2213,6 +2243,27 @@ class DeepseekV4AscendAttnBackend(
         # The compressed KV applies RoPE at the group's first token, matching
         # the decode path and ``comp_pos = (position // ratio) * ratio``.
         compressed_positions = torch.gather(positions, 0, indices) + (1 - ratio)
+        # Temporary debug: a negative comp position reaches the compressor's
+        # rope index_select and dies inside gather_v3 ("Index -3 out of
+        # range"). Dump the offending request state instead of crashing blind:
+        # a negative value means a selected row's position was 0, i.e.
+        # positions and seq_lens_cpu disagree (stale refill / padding row).
+        if compressed_positions.numel() and int(
+            compressed_positions.min().item()
+        ) < 0:
+            bad = compressed_positions < 0
+            logger.error(
+                "[verify cmp-pos NEGATIVE] ratio=%d n_draft=%d bad_vals=%s "
+                "src_positions=%s seq_lens_cpu[:8]=%s request_num=%d "
+                "indices_head=%s",
+                ratio,
+                n_draft,
+                compressed_positions[bad][:8].tolist(),
+                positions[indices[bad][:8]].tolist(),
+                seq_lens_cpu[:8].tolist(),
+                request_num,
+                indices[:8].tolist(),
+            )
         dst[: indices.numel()].copy_(compressed_positions)
 
     def update_verify_buffers_to_fill_after_draft(
@@ -2235,6 +2286,17 @@ class DeepseekV4AscendAttnBackend(
                     "forward metadata or seq_lens_cpu on spec_info."
                 )
             seq_lens_cpu = seq_lens_cpu + n_draft
+        # Same live-0 guard as _build_npu_compress_metadata_verify: final
+        # lengths must not resurrect idle/padding rows in the boundary mask,
+        # or their padding position 0 yields a negative comp position.
+        live_cpu = getattr(spec_info, "seq_lens_cpu", None)
+        if live_cpu is not None:
+            live_cpu = live_cpu[: seq_lens_cpu.shape[0]]
+            seq_lens_cpu = torch.where(
+                live_cpu > 0,
+                seq_lens_cpu,
+                torch.zeros_like(seq_lens_cpu),
+            )
 
         self._fill_verify_positions_cmp_padding_one(
             positions, c4_positions, 4, seq_lens_cpu, n_draft=n_draft
