@@ -26,6 +26,28 @@ if TYPE_CHECKING:
 
 _PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 
+# fused_deep_moe quant_mode slot: the A5 aclnnFusedDeepMoe host derives the
+# FP4 vs FP8 vs int8 GMM from the gmm1 weight dtype itself, so the value is
+# not a user-facing switch — test_fused_deep_moe_a5.py pins the same fixed
+# compatibility value 0 (FUSED_COMPAT_QUANT_MODE). 1 = int8 (W8A8) for the
+# int8 weight contract.
+_FUSEEP_QUANT_MODE_INT8 = 1
+_FUSEEP_QUANT_MODE_COMPAT = 0
+
+
+def _is_fp4_moe_layer(layer: FusedMoE) -> bool:
+    """Identify FP4 experts by their quant method.
+
+    Weight dtype is not a reliable discriminator across the load lifecycle
+    (checkpoint bytes are uint8-packed before repacking), so the quant method
+    is checked instead.
+    """
+    from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
+        NPUW4A4Fp4MoEMethod,
+    )
+
+    return isinstance(layer.quant_method, NPUW4A4Fp4MoEMethod)
+
 
 def _get_fuseep_buffer(layer: FusedMoE):
     DeepEPBuffer.set_dispatch_mode_as_low_latency()
@@ -44,19 +66,43 @@ def forward_fuseep(
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
 ) -> torch.Tensor:
+    if _is_fp4_moe_layer(layer):
+        # FP4 scales ship as raw E8M0 exponent bytes (uint8, [E, N, K/32]).
+        # Re-interpret and pair them as [E, N, K/64, 2] — the layout the A5
+        # fused op's B-scale tensor assumes (MakeMxScaleLayout with a 2-wide
+        # pair dim, matching npu_dynamic_mx_quant(axis=1) output — see
+        # test_fused_deep_moe_a5.py). The deep_ep wrapper's `.float()` then
+        # decodes the power-of-two value instead of casting the byte as an
+        # integer. int8 layers keep their dequant scales in float dtypes and
+        # need no reinterpret.
+        w13_scale = (
+            layer.w13_weight_scale_inv.view(torch.float8_e8m0fnu)
+            .reshape(*layer.w13_weight_scale_inv.shape[:-1], -1, 2)
+        )
+        w2_scale = (
+            layer.w2_weight_scale_inv.view(torch.float8_e8m0fnu)
+            .reshape(*layer.w2_weight_scale_inv.shape[:-1], -1, 2)
+        )
+        quant_mode = _FUSEEP_QUANT_MODE_COMPAT
+    else:
+        w13_scale = layer.w13_weight_scale
+        w2_scale = layer.w2_weight_scale
+        quant_mode = _FUSEEP_QUANT_MODE_INT8
+
     buf = _get_fuseep_buffer(layer)
     hidden_states, _ = buf.fused_deep_moe(
         hidden_states,
         topk_idx=topk_output.topk_ids,
         topk_weights=topk_output.topk_weights,
         gmm1_permuted_weight=layer.w13_weight,
-        gmm1_permuted_weight_scale=layer.w13_weight_scale,
+        gmm1_permuted_weight_scale=w13_scale,
         gmm2_weight=layer.w2_weight,
-        gmm2_weight_scale=layer.w2_weight_scale,
+        gmm2_weight_scale=w2_scale,
         num_max_dispatch_tokens_per_rank=(
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         ),
         num_experts=layer.num_experts,
+        quant_mode=quant_mode,
         fuse_mode=get_exec().moe.fuseep_mode,
     )
     return hidden_states
@@ -73,6 +119,78 @@ def _permute_w13_weight_scale(w: torch.Tensor, tile_n: int) -> torch.Tensor:
     w_reshaped = w.reshape(*dims, 2, n // tile_n, tile_n // 2)
     perm_order = list(range(len(dims))) + [-2, -3, -1]
     return w_reshaped.permute(perm_order).reshape(*dims, n)
+
+
+def repack_fp4_weight_for_fused_deep_moe(w: torch.Tensor) -> torch.Tensor:
+    """Repack checkpoint FP4 weights into the aclnnFusedDeepMoe (A5) layout.
+
+    The msmodelslim checkpoint stores packed FP4 as ``[E, N, K/2]`` uint8 with
+    two K values per byte (even k in the low nibble) — the layout the A5
+    ``npu_quant_matmul(x2_dtype=float4_e2m1fn_x2)`` consumes. The A5 fused op
+    instead consumes a logical ``[K, N]`` FP4 matrix packed along N
+    (``[E, K, N/2]``, even n in the low nibble) — the layout
+    ``npu_dynamic_mx_quant(axis=1)`` produces. This conversion is a lossless
+    nibble-level transpose. Block scales (checkpoint ``[E, N, K/32]`` uint8,
+    i.e. ``[E, N, K/64, 2]`` in the fused op's pair view) are already in the
+    kernel's N-major layout and need no change.
+    """
+    from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+        _get_float4_e2m1fn_x2_dtype,
+    )
+
+    if w.dim() != 3:
+        raise ValueError(
+            f"expected [E, N, K/2] packed FP4 weight, got {tuple(w.shape)}"
+        )
+    num_experts, n, k_half = w.shape
+    if n % 2 != 0:
+        raise ValueError(f"N dimension must be even for packed FP4, got {n}")
+
+    # val(e, n, k): even k in the low nibble of w[e, n, k//2], odd k in high.
+    # Split by source nibble, then interleave pairs along N:
+    #   out[e, k, j] = val(e, 2j, k) | val(e, 2j+1, k) << 4
+    even_n = w[:, 0::2, :]  # [E, N/2, K/2]
+    odd_n = w[:, 1::2, :]  # [E, N/2, K/2]
+    out = torch.empty(
+        (num_experts, k_half * 2, n // 2), dtype=torch.uint8, device=w.device
+    )
+    # k even -> low nibbles; k odd -> high nibbles (planes transposed to
+    # [E, K/2, N/2] to match the strided out slices)
+    out[:, 0::2, :] = ((even_n & 0x0F) | ((odd_n & 0x0F) << 4)).transpose(1, 2)
+    out[:, 1::2, :] = ((even_n >> 4) | ((odd_n >> 4) << 4)).transpose(1, 2)
+    return out.contiguous().view(_get_float4_e2m1fn_x2_dtype())
+
+
+def process_fp4_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
+    """Apply the FuseEP FP4 weight layout for a single weight group.
+
+    Invoked by ``NPUW4A4Fp4MoEMethod.maybe_process_fp4_fuseep_weights`` for
+    both ``"w13"`` and ``"w2"``.
+
+    The weight is repacked from the checkpoint's K-packed ``[E, N, K/2]``
+    bytes to the fused op's N-packed ``[E, K, N/2]`` fp4x2 layout. The scale
+    (``{prefix}_weight_scale_inv``) stays as the checkpoint's ``[E, N, K/32]``
+    uint8 — byte-identical to the fused op's N-major ``[N, K/64, 2]`` B-scale
+    view; ``forward_fuseep`` pairs the last dim when handing the scales to
+    deep_ep.
+    """
+    # FP4 experts run through the fused_deep_moe op (fuseep_mode 1), whose A5
+    # kernel consumes the N-packed fp4x2 layout above. fuseep_mode 2
+    # (dispatch_ffn_combine) only implements the int8 weight contract in the
+    # fused op — fail fast at load time instead of hitting the C++ assert on
+    # the first forward.
+    from sglang.srt.runtime_context import get_exec
+
+    if get_exec().moe.fuseep_mode != 1:
+        raise NotImplementedError(
+            "FP4 experts on ascend_fuseep require --fuseep-mode 1 "
+            "(dispatch_gmm_combine_decode); mode "
+            f"{get_exec().moe.fuseep_mode} (dispatch_ffn_combine) is "
+            "int8-only in the fused op."
+        )
+
+    weight = getattr(layer, f"{weight_prefix}_weight")
+    weight.data = repack_fp4_weight_for_fused_deep_moe(weight.data)
 
 
 def _reshape_w13_weight(

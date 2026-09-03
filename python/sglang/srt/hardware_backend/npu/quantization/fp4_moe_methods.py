@@ -156,6 +156,32 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         self._fp8.moe_runner_config = moe_runner_config
 
+    @staticmethod
+    def maybe_process_fp4_fuseep_weights(layer: torch.nn.Module) -> bool:
+        """Apply the FuseEP FP4 weight layout if --moe-a2a-backend is ascend_fuseep.
+
+        Returns True when the FuseEP layout was (or has already been) applied,
+        so that the caller can skip its own ``process_weights_after_loading``
+        body.
+        """
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_ascend_fuseep():
+            return False
+
+        # Guard against double processing when called for multiple prefixes.
+        if getattr(layer, "_fuseep_weights_processed", False):
+            return True
+
+        from sglang.srt.hardware_backend.npu.moe.fuseep import (
+            process_fp4_fuseep_weights,
+        )
+
+        for prefix in ("w13", "w2"):
+            process_fp4_fuseep_weights(layer, prefix)
+        layer._fuseep_weights_processed = True
+        return True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 
@@ -172,26 +198,27 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
                 "not match w2_weight_scale_inv."
             )
 
-        nz_kwargs = {
-            "customize_dtype": torch.float8_e4m3fn,
-            "input_dtype": _get_float4_e2m1fn_x2_dtype(),
-        }
-        nz_format = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
-        layer.w13_weight.data = npu_format_cast(
-            layer.w13_weight.data.view(torch.uint8), nz_format, **nz_kwargs
-        ).transpose(1, 2)
-        layer.w2_weight.data = npu_format_cast(
-            layer.w2_weight.data.view(torch.uint8), nz_format, **nz_kwargs
-        ).transpose(1, 2)
+        if not self.maybe_process_fp4_fuseep_weights(layer):
+            nz_kwargs = {
+                "customize_dtype": torch.float8_e4m3fn,
+                "input_dtype": _get_float4_e2m1fn_x2_dtype(),
+            }
+            nz_format = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
+            layer.w13_weight.data = npu_format_cast(
+                layer.w13_weight.data.view(torch.uint8), nz_format, **nz_kwargs
+            ).transpose(1, 2)
+            layer.w2_weight.data = npu_format_cast(
+                layer.w2_weight.data.view(torch.uint8), nz_format, **nz_kwargs
+            ).transpose(1, 2)
 
-        layer.w13_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale_inv.data),
-            requires_grad=False,
-        )
-        layer.w2_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale_inv.data),
-            requires_grad=False,
-        )
+            layer.w13_weight_scale_inv = torch.nn.Parameter(
+                _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale_inv.data),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale_inv = torch.nn.Parameter(
+                _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale_inv.data),
+                requires_grad=False,
+            )
 
         _configure_dsv4_deepep_dispatcher(layer)
 
