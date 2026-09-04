@@ -529,6 +529,16 @@ class C4IndexerAscendBackendMixin:
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
 
+    def _maybe_prefetch_layer_splits(self, c4_indexer) -> None:
+        """Layer split: the layer's writes are queued on the current stream —
+        launch its remote reads on the comm stream now so they overlap the
+        indexer/attention compute; the pool's read entry waits on the event."""
+        prefetch_read = getattr(self.token_to_kv_pool, "prefetch_read", None)
+        if prefetch_read is None:
+            return
+        for family in ("index_k", "index_scale", "c4"):
+            prefetch_read(family, c4_indexer.layer_id)
+
     def _forward_prepare(
         self,
         c4_indexer,
@@ -542,6 +552,7 @@ class C4IndexerAscendBackendMixin:
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
         if not skip_compressor:
             c4_indexer.compressor(x, forward_batch)
+            self._maybe_prefetch_layer_splits(c4_indexer)
         return q, weights
 
     def _can_use_indexer_multi_stream(self) -> bool:
@@ -578,6 +589,7 @@ class C4IndexerAscendBackendMixin:
         # route-KV write on cur; ordered before the topk read by cur's program order.
         if not skip_compressor:
             c4_indexer.compressor(x, forward_batch)
+            self._maybe_prefetch_layer_splits(c4_indexer)
 
         # weights_proj + scale on stream_w.
         with torch.npu.stream(stream_w):

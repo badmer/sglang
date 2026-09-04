@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -347,6 +347,13 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         # Active-page plan of the current forward (set by the attention
         # backend once per forward): family -> sorted page ids to transfer.
         self._staging_plan: Optional[Dict[str, torch.Tensor]] = None
+        # Async remote reads: family -> (layer_id, event, keepalive) for the
+        # transfer launched on the comm stream and not yet consumed.
+        self._prefetch_pending: Dict[str, Optional[Tuple[int, Any, tuple]]] = {
+            family: None for family in _REMOTE_FAMILIES
+        }
+        self._prefetch_enabled = envs.SGLANG_DSV4_LS_PREFETCH.get()
+        self._comm_stream: Optional[torch.npu.Stream] = None
         # Shared chunk-staging operand; int8 is the smallest family dtype, so
         # byte capacity == element capacity.
         self._staging = torch.zeros(
@@ -475,6 +482,18 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LSSELF failed: %s", exc)
         target = local if local is not None else remote
+        # Consume a prefetched transfer for this family when it matches; a
+        # stale pending transfer (different layer) is waited on and discarded
+        # so the fresh read below cannot race the comm stream's writes.
+        pending = self._prefetch_pending.get(family)
+        if pending is not None:
+            self._prefetch_pending[family] = None
+            pending_layer, event = pending[0], pending[1]
+            torch.npu.current_stream().wait_event(event)
+            if pending_layer == layer_id:
+                self._remote_layer_cache[family] = layer_id
+                self._read_seq += 1
+                return target
         # attn_cp_group must have no other submitters while layer split is on:
         # the duplicate attn_cp_overlap group (bootstrap.py) owns the side
         # -stream CP collectives, and HCCL pairs this group's collectives by
@@ -623,15 +642,71 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         selected: torch.Tensor,
         group,
     ) -> None:
-        """Transfer only the forward's active pages of ``family``/``layer_id``.
+        """Synchronously transfer the forward's active pages of
+        ``family``/``layer_id`` on the current stream. Both CP ranks agree on
+        ``selected`` (the group-wide union from ``begin_forward_staging``);
+        the non-owner scatters the gathered pages at their ORIGINAL page ids,
+        so consumer page tables need no remap."""
+        self._launch_allgather_selected(
+            local, remote, selected, layer_id, group, keepalive=[]
+        )
 
-        Both CP ranks agree on ``selected`` (the group-wide union from
-        ``begin_forward_staging``). The owner stages each selected page of its
-        local buffer; the non-owner scatters the gathered pages back at their
-        ORIGINAL page ids, so the scratch keeps page-id addressing and the
-        consumer page tables need no remap. Pages outside the plan are never
-        addressed by this forward's attention.
+    def _invalidate_wait_pending(self, family: str) -> None:
+        """Order a pending async transfer before a write overwrites the same
+        family scratch: the write must land after the transfer, not during."""
+        pending = self._prefetch_pending.get(family)
+        if pending is not None:
+            self._prefetch_pending[family] = None
+            torch.npu.current_stream().wait_event(pending[1])
+
+    def prefetch_read(self, family: str, layer_id: int) -> None:
+        """Launch this family/layer's remote read on the comm stream.
+
+        Call right after the layer's writes are enqueued on the current
+        stream: the transfer then overlaps the layer's remaining compute and
+        the later ``_read_layer_buffer`` only waits on the recorded event.
+        Requires the active-page staging plan (the async launch supports the
+        selected-page transfer only). Both CP ranks issue symmetrically.
         """
+        if not self._prefetch_enabled:
+            return
+        if self._remote_layer_cache[family] == layer_id:
+            return
+        pending = self._prefetch_pending.get(family)
+        if pending is not None and pending[0] == layer_id:
+            return
+        selected = (self._staging_plan or {}).get(
+            self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
+        )
+        if selected is None or selected.numel() >= self._remote_buffers[family].shape[0]:
+            return
+        local = self._local_family_buffer(family, layer_id)
+        remote = self._remote_buffers[family]
+        group = get_parallel().attn_cp_group
+        if self._comm_stream is None:
+            self._comm_stream = torch.npu.Stream()
+        comm = self._comm_stream
+        comm.wait_stream(torch.npu.current_stream())
+        keepalive: list = []
+        with torch.npu.stream(comm):
+            self._launch_allgather_selected(
+                local, remote, selected, layer_id, group, keepalive
+            )
+            event = torch.npu.Event()
+            event.record(comm)
+        self._prefetch_pending[family] = (layer_id, event, tuple(keepalive))
+
+    def _launch_allgather_selected(
+        self,
+        local: Optional[torch.Tensor],
+        remote: torch.Tensor,
+        selected: torch.Tensor,
+        layer_id: int,
+        group,
+        keepalive: list,
+    ) -> None:
+        """Enqueue the selected-page all-gather (+ receiver scatter) on the
+        CURRENT stream context — call inside the target stream context."""
         pages = remote.shape[0]
         flat_dst = remote.reshape(pages, -1)
         row_elems = flat_dst.shape[1]
@@ -654,11 +729,13 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                 device=flat_dst.device,
             )
             group.all_gather_into_tensor(gathered, send)
+            keepalive.append(gathered)
             if flat_src is None:
                 flat_dst.index_copy_(0, sel, gathered[owner_slot])
 
     def _invalidate_family(self, families: Tuple[str, ...], layer_id: int) -> None:
         for family in families:
+            self._invalidate_wait_pending(family)
             if self._remote_layer_cache[family] == layer_id:
                 self._remote_layer_cache[family] = None
 

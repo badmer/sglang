@@ -482,6 +482,10 @@ class Envs:
     # staging tensor and a chunked all-gather; broadcast corrupts payload
     # bytes on the ZBAL-interposed torch.distributed of this stack.
     SGLANG_DSV4_LS_CHUNK_BYTES = EnvInt(1024 * 1024)
+    # DSV4 layer-split: launch the remote-layer read right after the layer's
+    # write, on the attn-cp overlap comm stream, so the transfer overlaps the
+    # layer's remaining compute; the consumer waits on the recorded event.
+    SGLANG_DSV4_LS_PREFETCH = EnvBool(False)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
