@@ -390,6 +390,17 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             torch.distributed.all_reduce(mask, group=group.device_group)
             plan[family] = torch.nonzero(mask, as_tuple=False).flatten()
         self._staging_plan = plan
+        if _LS_DEBUG:
+            for family, sel in plan.items():
+                logger.warning(
+                    "LSPLAN rank=%d family=%s pages=%d/%d",
+                    self.layer_shard_rank,
+                    family,
+                    int(sel.numel()),
+                    self._remote_buffers[family].shape[0],
+                )
+            if not plan:
+                logger.warning("LSPLAN rank=%d empty plan", self.layer_shard_rank)
 
     def _self_test_delivery(self) -> None:
         """One-shot delivery check before the first read, exercising the same
