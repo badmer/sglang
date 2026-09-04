@@ -1065,6 +1065,18 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_has_c128:
             fm.c128_page_table = _select_rows(full_fields["c128_page_table"])
 
+        # Layer split: hand this forward's per-family page tables to the pool
+        # so non-owned layers transfer only the active pages (CP-group union).
+        begin_staging = getattr(self.token_to_kv_pool, "begin_forward_staging", None)
+        if begin_staging is not None:
+            begin_staging(
+                {
+                    "swa": fm.swa_page_table,
+                    "c4": fm.c4_page_table,
+                    "c128": fm.c128_page_table,
+                }
+            )
+
         local_t = int(local_idx.numel())
         fm.actual_seq_lengths_q = torch.arange(
             1, local_t + 1, dtype=torch.int32, device=device

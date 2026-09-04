@@ -344,6 +344,9 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         self._remote_layer_cache: Dict[str, Optional[int]] = {
             family: None for family in _REMOTE_FAMILIES
         }
+        # Active-page plan of the current forward (set by the attention
+        # backend once per forward): family -> sorted page ids to transfer.
+        self._staging_plan: Optional[Dict[str, torch.Tensor]] = None
         # Shared chunk-staging operand; int8 is the smallest family dtype, so
         # byte capacity == element capacity.
         self._staging = torch.zeros(
@@ -354,6 +357,39 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         self._read_seq = 0
         self._read_mismatch = 0
         self._self_test_pending = _LS_DEBUG
+
+    # index_k / index_scale share the c4 page-id space and the c4 plan.
+    _STAGING_PLAN_FAMILY_ALIAS = {"index_k": "c4", "index_scale": "c4"}
+
+    def begin_forward_staging(
+        self, tables: Dict[str, Optional[torch.Tensor]]
+    ) -> None:
+        """Record the forward's active pages per family (CP-group union).
+
+        Called once per prefill forward by the attention backend with the
+        per-family page tables; both CP ranks call symmetrically. Reads of
+        non-owned layers then transfer only these pages, scattered at their
+        original page ids, so consumer page tables need no remap. Pages
+        outside the union are never addressed by this forward's attention.
+        """
+        group = get_parallel().attn_cp_group
+        plan: Dict[str, torch.Tensor] = {}
+        for family, table in tables.items():
+            remote = self._remote_buffers.get(family)
+            if remote is None or table is None or table.numel() == 0:
+                continue
+            max_pages = remote.shape[0]
+            flat = table.reshape(-1).to(torch.long)
+            valid = (flat >= 0) & (flat < max_pages)
+            mask = torch.zeros(max_pages, dtype=torch.int32, device=flat.device)
+            mask.index_add_(
+                0,
+                flat[valid],
+                torch.ones(int(valid.sum()), dtype=torch.int32, device=flat.device),
+            )
+            torch.distributed.all_reduce(mask, group=group.device_group)
+            plan[family] = torch.nonzero(mask, as_tuple=False).flatten()
+        self._staging_plan = plan
 
     def _self_test_delivery(self) -> None:
         """One-shot delivery check before the first read, exercising the same
@@ -433,6 +469,28 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         # -stream CP collectives, and HCCL pairs this group's collectives by
         # submission order only.
         group = get_parallel().attn_cp_group
+        selected = (self._staging_plan or {}).get(
+            self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
+        )
+        if selected is not None and selected.numel() < remote.shape[0]:
+            self._read_via_allgather_selected(
+                family, layer_id, local, remote, selected, group
+            )
+            self._remote_layer_cache[family] = layer_id
+            self._read_seq += 1
+            if _LS_DEBUG:
+                # Whole-buffer fingerprints are meaningless under staging:
+                # untouched scratch pages stay stale by design.
+                logger.warning(
+                    "LSDBG-STAGING rank=%d seq=%d %s:%d pages=%d/%d",
+                    self.layer_shard_rank,
+                    self._read_seq,
+                    family,
+                    layer_id,
+                    int(selected.numel()),
+                    remote.shape[0],
+                )
+            return target
         if _LS_DEBUG and _LS_SYNC:
             torch.npu.synchronize()
         pre = _probe_stats(target) if _LS_DEBUG else None
@@ -544,6 +602,49 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             group.all_gather_into_tensor(gathered, send)
             if flat_src is None:
                 flat_dst[start:end].copy_(gathered[owner_slot])
+
+    def _read_via_allgather_selected(
+        self,
+        family: str,
+        layer_id: int,
+        local: Optional[torch.Tensor],
+        remote: torch.Tensor,
+        selected: torch.Tensor,
+        group,
+    ) -> None:
+        """Transfer only the forward's active pages of ``family``/``layer_id``.
+
+        Both CP ranks agree on ``selected`` (the group-wide union from
+        ``begin_forward_staging``). The owner stages each selected page of its
+        local buffer; the non-owner scatters the gathered pages back at their
+        ORIGINAL page ids, so the scratch keeps page-id addressing and the
+        consumer page tables need no remap. Pages outside the plan are never
+        addressed by this forward's attention.
+        """
+        pages = remote.shape[0]
+        flat_dst = remote.reshape(pages, -1)
+        row_elems = flat_dst.shape[1]
+        elem = flat_dst.element_size()
+        step_pages = max(1, _LS_CHUNK_BYTES // (row_elems * elem))
+        owner_slot = self._layer_owner_rank(layer_id)
+        flat_src = None if local is None else local.reshape(pages, -1)
+        for sel in selected.split(step_pages):
+            n = int(sel.numel())
+            send = (
+                self._staging[: n * row_elems * elem]
+                .view(flat_dst.dtype)
+                .view(n, row_elems)
+            )
+            if flat_src is not None:
+                send.copy_(flat_src.index_select(0, sel))
+            gathered = torch.empty(
+                (group.world_size, n, row_elems),
+                dtype=flat_dst.dtype,
+                device=flat_dst.device,
+            )
+            group.all_gather_into_tensor(gathered, send)
+            if flat_src is None:
+                flat_dst.index_copy_(0, sel, gathered[owner_slot])
 
     def _invalidate_family(self, families: Tuple[str, ...], layer_id: int) -> None:
         for family in families:

@@ -288,6 +288,33 @@ def _run(rank: int, world: int, port: int):
     assert ok, f"rank {rank} post-write contents incorrect"
 
     print(f"[rank {cp_rank}] OK: allocation, PD reports and owner broadcast verified")
+
+    # --- staging: only planned pages transfer, scattered at their page ids --
+    # Each rank refills its OWNED layers with a fresh constant and zeroes the
+    # scratch (killing earlier whole-layer reads), plans swa pages {0,1}
+    # (< 3), then reads its first NON-OWNED layer: the staged scratch must
+    # hold the owner's fresh bytes on exactly the planned pages, with
+    # unplanned pages left at zero.
+    for l in range(LAYER_NUM):
+        if pool._is_layer_owned(l):
+            pool.swa_kv_pool.kv_buffer[l].fill_(55.0)
+    pool._remote_buffers["swa"].zero_()
+    pool._remote_layer_cache["swa"] = None
+    pool.begin_forward_staging(
+        {"swa": torch.tensor([[0, 1]], dtype=torch.long, device=f"npu:{rank}")}
+    )
+    remote_layer = next(l for l in range(LAYER_NUM) if not pool._is_layer_owned(l))
+    staged = pool.get_swa_buffer(remote_layer)
+    staged2d = staged.reshape(staged.shape[0], -1).float()
+    ok = ok and bool(
+        torch.all(staged2d[0] == 55.0) and torch.all(staged2d[1] == 55.0)
+    )
+    if not pool._is_layer_owned(remote_layer):
+        ok = ok and bool(torch.all(staged2d[2:] == 0))
+    pool._staging_plan = None
+    assert ok, f"rank {rank} staging read incorrect"
+
+    print(f"[rank {cp_rank}] OK: allocation, PD reports and owner staging verified")
     torch.distributed.barrier()
 
 
