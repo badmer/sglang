@@ -521,6 +521,7 @@ class CompressorAscendBackendMixin:
             kv_scale,
             compressor.is_in_indexer,
         )
+        self._maybe_prefetch_layer_splits(compressor.layer_id)
 
 
 class C4IndexerAscendBackendMixin:
@@ -529,15 +530,14 @@ class C4IndexerAscendBackendMixin:
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
 
-    def _maybe_prefetch_layer_splits(self, c4_indexer) -> None:
+    def _maybe_prefetch_layer_splits(self, layer_id: int) -> None:
         """Layer split: the layer's writes are queued on the current stream —
         launch its remote reads on the comm stream now so they overlap the
         indexer/attention compute; the pool's read entry waits on the event."""
         prefetch_read = getattr(self.token_to_kv_pool, "prefetch_read", None)
         if prefetch_read is None:
             return
-        for family in ("index_k", "index_scale", "c4"):
-            prefetch_read(family, c4_indexer.layer_id)
+        prefetch_read(layer_id)
 
     def _forward_prepare(
         self,
@@ -552,7 +552,7 @@ class C4IndexerAscendBackendMixin:
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
         if not skip_compressor:
             c4_indexer.compressor(x, forward_batch)
-            self._maybe_prefetch_layer_splits(c4_indexer)
+            self._maybe_prefetch_layer_splits(c4_indexer.layer_id)
         return q, weights
 
     def _can_use_indexer_multi_stream(self) -> bool:
@@ -589,7 +589,7 @@ class C4IndexerAscendBackendMixin:
         # route-KV write on cur; ordered before the topk read by cur's program order.
         if not skip_compressor:
             c4_indexer.compressor(x, forward_batch)
-            self._maybe_prefetch_layer_splits(c4_indexer)
+            self._maybe_prefetch_layer_splits(c4_indexer.layer_id)
 
         # weights_proj + scale on stream_w.
         with torch.npu.stream(stream_w):
@@ -1077,17 +1077,22 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_has_c128:
             fm.c128_page_table = _select_rows(full_fields["c128_page_table"])
 
-        # Layer split: hand this forward's per-family page tables to the pool
-        # so non-owned layers transfer only the active pages (CP-group union).
+        # Layer split: hand the FULL-batch page tables (identical on both CP
+        # ranks, unlike the CP-local selection whose row count tracks local
+        # tokens) to the pool so the active-page plan — and therefore the
+        # collectives — stay symmetric even when one rank gets zero tokens.
         begin_staging = getattr(self.token_to_kv_pool, "begin_forward_staging", None)
         if begin_staging is not None:
             begin_staging(
                 {
-                    "swa": fm.swa_page_table,
-                    "c4": fm.c4_page_table,
-                    "c128": fm.c128_page_table,
+                    "swa": full_fields["swa_page_table"],
+                    "c4": full_fields["c4_page_table"],
+                    "c128": full_fields["c128_page_table"],
                 }
             )
+            prepare_forward = getattr(self.token_to_kv_pool, "prepare_forward", None)
+            if prepare_forward is not None:
+                prepare_forward(require_prefetched_reads=True)
 
         local_t = int(local_idx.numel())
         fm.actual_seq_lengths_q = torch.arange(
@@ -1654,6 +1659,13 @@ class DeepseekV4AscendAttnBackend(
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
+        # Each forward starts with async reads disallowed; the prefill-CP
+        # metadata prep (below) flips it on once its page tables exist. Without
+        # the reset, a non-CP forward (EAGLE target verify) would inherit the
+        # stale requirement and raise on its whole-layer fallback reads.
+        prepare_forward = getattr(self.token_to_kv_pool, "prepare_forward", None)
+        if prepare_forward is not None:
+            prepare_forward(require_prefetched_reads=False)
 
         # Idle DP-attention ranks have zero seq_lens, which the metadata kernel
         # cannot handle; skip it and leave the fields cleared but well-typed.
@@ -2030,6 +2042,7 @@ class DeepseekV4AscendAttnBackend(
             loc=swa_loc,
             cache=swa_k,
         )
+        self._maybe_prefetch_layer_splits(layer_id)
 
     def _build_npu_compress_metadata_verify(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata

@@ -354,6 +354,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         }
         self._prefetch_enabled = envs.SGLANG_DSV4_LS_PREFETCH.get()
         self._comm_stream: Optional[torch.npu.Stream] = None
+        self._require_prefetched_reads = False
         # Shared chunk-staging operand; int8 is the smallest family dtype, so
         # byte capacity == element capacity.
         self._staging = torch.zeros(
@@ -494,6 +495,11 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                 self._remote_layer_cache[family] = layer_id
                 self._read_seq += 1
                 return target
+        if self._require_prefetched_reads and self._prefetch_enabled and local is None:
+            raise RuntimeError(
+                f"layer split: non-owned read {family}:{layer_id} without a "
+                "prefetched transfer — the async read hooks were lost"
+            )
         # attn_cp_group must have no other submitters while layer split is on:
         # the duplicate attn_cp_overlap group (bootstrap.py) owns the side
         # -stream CP collectives, and HCCL pairs this group's collectives by
@@ -659,17 +665,40 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             self._prefetch_pending[family] = None
             torch.npu.current_stream().wait_event(pending[1])
 
-    def prefetch_read(self, family: str, layer_id: int) -> None:
-        """Launch this family/layer's remote read on the comm stream.
+    def prepare_forward(self, require_prefetched_reads: bool) -> None:
+        """Reset the per-forward async-read requirement.
+
+        The attention backend sets it True once the prefill-CP page tables are
+        ready: from then on a non-owned read must hit a prefetched transfer
+        (or the cache) — falling back to a synchronous read means the prefetch
+        hooks were lost, and the stale-scratch race they prevent would be
+        silently reintroduced.
+        """
+        self._require_prefetched_reads = require_prefetched_reads
+
+    def prefetch_read(self, layer_id: int) -> None:
+        """Launch this layer's remote reads on the comm stream.
 
         Call right after the layer's writes are enqueued on the current
         stream: the transfer then overlaps the layer's remaining compute and
         the later ``_read_layer_buffer`` only waits on the recorded event.
         Requires the active-page staging plan (the async launch supports the
-        selected-page transfer only). Both CP ranks issue symmetrically.
+        selected-page transfer only). Families follow the layer's compression
+        ratio. Both CP ranks issue symmetrically.
         """
         if not self._prefetch_enabled:
             return
+        ratio = self.layer_mapping[layer_id].compress_ratio
+        if ratio == 0:
+            families = ("swa",)
+        elif ratio == 128:
+            families = ("c128",)
+        else:
+            families = ("c4", "index_k", "index_scale")
+        for family in families:
+            self._prefetch_family(family, layer_id)
+
+    def _prefetch_family(self, family: str, layer_id: int) -> None:
         if self._remote_layer_cache[family] == layer_id:
             return
         pending = self._prefetch_pending.get(family)
