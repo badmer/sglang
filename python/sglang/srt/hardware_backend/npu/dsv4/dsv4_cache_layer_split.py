@@ -361,10 +361,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         # prefix transfers are tracked per (family, layer_id) in
         # _prefix_events (event or None when the portion was empty).
         self._prefix_events: Dict[Tuple[str, int], Optional[torch.npu.Event]] = {}
-        self._fresh_pending: Dict[str, Optional[Tuple[int, torch.npu.Event]]] = {
-            family: None for family in _REMOTE_FAMILIES
-        }
-        self._prefetch_pending: Dict[str, Optional[Tuple[int, Any, tuple]]] = {
+        self._fresh_pending: Dict[str, Optional[Tuple[int, Any, tuple]]] = {
             family: None for family in _REMOTE_FAMILIES
         }
         self._prefetch_enabled = envs.SGLANG_DSV4_LS_PREFETCH.get()
@@ -773,7 +770,8 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                 local = self._local_family_buffer(family, layer_id)
                 remote = self._remote_buffers[family]
                 self._launch_allgather_selected(
-                    local, remote, sel, layer_id, group, keepalive
+                    local, remote, sel, layer_id, group, keepalive,
+                    tag=f"prefix:{family}",
                 )
                 launched.append((key, len(keepalive)))
             event = torch.npu.Event()
@@ -821,7 +819,8 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                 local = self._local_family_buffer(family, layer_id)
                 remote = self._remote_buffers[family]
                 self._launch_allgather_selected(
-                    local, remote, sel, layer_id, group, keepalive
+                    local, remote, sel, layer_id, group, keepalive,
+                    tag=f"fresh:{family}",
                 )
                 launched.append(family)
             event = torch.npu.Event()
@@ -850,9 +849,9 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
     def _invalidate_wait_pending(self, family: str) -> None:
         """Order a pending async transfer before a write overwrites the same
         family scratch: the write must land after the transfer, not during."""
-        pending = self._prefetch_pending.get(family)
+        pending = self._fresh_pending.get(family)
         if pending is not None:
-            self._prefetch_pending[family] = None
+            self._fresh_pending[family] = None
             torch.npu.current_stream().wait_event(pending[1])
 
     def prepare_forward(self, require_prefetched_reads: bool) -> None:
@@ -874,9 +873,21 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         layer_id: int,
         group,
         keepalive: list,
+        tag: str = "",
     ) -> None:
         """Enqueue the selected-page all-gather (+ receiver scatter) on the
         CURRENT stream context — call inside the target stream context."""
+        if _LS_DEBUG:
+            logger.warning(
+                "LSLAUNCH rank=%d tag=%s layer=%d pages=%d chunks=%d",
+                self.layer_shard_rank,
+                tag,
+                layer_id,
+                int(selected.numel()),
+                len(selected.split(max(1, _LS_CHUNK_BYTES // (
+                    remote.reshape(remote.shape[0], -1).shape[1]
+                    * remote.element_size())))),
+            )
         pages = remote.shape[0]
         flat_dst = remote.reshape(pages, -1)
         row_elems = flat_dst.shape[1]
