@@ -550,6 +550,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         target = local if local is not None else remote
         stream = torch.npu.current_stream()
         covered = False
+        selected = None
         if self._staging_plan is not None:
             # Consume this layer's async transfers: the prefix portion
             # (launched up front / by the previous layer) and the fresh
@@ -559,6 +560,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             prefix_ev = self._prefix_events.pop((family, layer_id), _NOT_LAUNCHED)
             fresh = self._fresh_pending.get(family)
             self._fresh_pending[family] = None
+            selected = self._staging_selected.get(family)
             if prefix_ev is not None and prefix_ev is not _NOT_LAUNCHED:
                 stream.wait_event(prefix_ev)
             if fresh is not None:
@@ -591,9 +593,6 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                         remote.shape[0],
                     )
                 return target
-            selected = self._staging_selected.get(alias_family)
-        else:
-            selected = None
         # attn_cp_group must have no other submitters while layer split is on:
         # the duplicate attn_cp_overlap group (bootstrap.py) owns the side
         # -stream CP collectives, and HCCL pairs this group's collectives by
