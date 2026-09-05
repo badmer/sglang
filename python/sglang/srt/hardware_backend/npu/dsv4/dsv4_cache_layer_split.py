@@ -457,6 +457,12 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         self._remote_layer_cache = {family: None for family in _REMOTE_FAMILIES}
         self._staging_plan = tables
         if _LS_DEBUG:
+            if prefix_lens:
+                logger.warning(
+                    "LSPLAN-PLEN rank=%d prefix_lens=%s",
+                    self.layer_shard_rank,
+                    prefix_lens,
+                )
             for family in self._staging_selected:
                 pre = self._staging_prefix[family]
                 fresh = self._staging_fresh[family]

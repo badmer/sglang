@@ -1096,9 +1096,7 @@ class DeepseekV4AscendAttnBackend(
         # collectives — stay symmetric even when one rank gets zero tokens.
         begin_staging = getattr(self.token_to_kv_pool, "begin_forward_staging", None)
         if begin_staging is not None:
-            prefix_lens = self._to_cpu_int_list(
-                getattr(forward_batch, "extend_prefix_lens_cpu", None)
-            )
+            prefix_lens = self._extend_prefix_lens_cpu(forward_batch)
             begin_staging(
                 {
                     "swa": full_fields["swa_page_table"],
