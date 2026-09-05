@@ -863,12 +863,14 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         if not self._prefetch_enabled or self._staging_plan is None:
             return
         ratio = self.layer_mapping[layer_id].compress_ratio
+        # every layer reads its swa-window buffer; compressed layers add
+        # their sparse families on top
         if ratio == 0:
             families = ("swa",)
         elif ratio == 128:
-            families = ("c128",)
+            families = ("swa", "c128")
         else:
-            families = ("c4", "index_k", "index_scale")
+            families = ("swa", "c4", "index_k", "index_scale")
         group = get_parallel().attn_cp_group
         if self._comm_stream is None:
             self._comm_stream = torch.npu.Stream()
