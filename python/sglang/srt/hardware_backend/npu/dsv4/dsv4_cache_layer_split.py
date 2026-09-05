@@ -795,7 +795,9 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                 key = (family, layer_id)
                 if key in self._prefix_events:
                     continue
-                sel = self._staging_prefix.get(family)
+                sel = self._staging_prefix.get(
+                    self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
+                )
                 if sel is None or sel.numel() == 0:
                     self._prefix_events[key] = None
                     continue
@@ -839,7 +841,9 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             for family in families:
                 if self._remote_layer_cache[family] == layer_id:
                     continue
-                sel = self._staging_fresh.get(family)
+                sel = self._staging_fresh.get(
+                    self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
+                )
                 if sel is None or sel.numel() == 0:
                     continue
                 if (
