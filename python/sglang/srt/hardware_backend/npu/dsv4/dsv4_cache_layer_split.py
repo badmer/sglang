@@ -556,7 +556,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             )
             fresh = self._fresh_pending.get(family)
             self._fresh_pending[family] = None
-            if prefix_ev is not None:
+            if prefix_ev is not None and prefix_ev is not _NOT_LAUNCHED:
                 stream.wait_event(prefix_ev)
             if fresh is not None:
                 stream.wait_event(fresh[1])
