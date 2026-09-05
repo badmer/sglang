@@ -810,52 +810,6 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         for key, _ in launched:
             self._prefix_events[key] = event
 
-    def prefetch_prefix(self, layer_id: int) -> None:
-        """Launch this layer's prefix-portion transfers on the comm stream.
-
-        Prefix pages were written by earlier chunks and stay stable for the
-        whole forward, so this is safe any time before the layer's reads;
-        calling it at the end of the previous layer's forward overlaps the
-        transfer with that layer's compute. Idempotent per forward.
-        """
-        if not self._prefetch_enabled or self._staging_plan is None:
-            return
-        if layer_id >= self.layer_num:
-            return
-        ratio = self.layer_mapping[layer_id].compress_ratio
-        if ratio == 0:
-            families = ("swa",)
-        elif ratio == 128:
-            families = ("swa", "c128")
-        else:
-            families = ("swa", "c4", "index_k", "index_scale")
-        group = get_parallel().attn_cp_group
-        if self._comm_stream is None:
-            self._comm_stream = torch.npu.Stream()
-        comm = self._comm_stream
-        comm.wait_stream(torch.npu.current_stream())
-        keepalive: list = []
-        launched: list = []
-        with torch.npu.stream(comm):
-            for family in families:
-                key = (family, layer_id)
-                if key in self._prefix_events:
-                    continue
-                sel = self._staging_prefix.get(family)
-                if sel is None or sel.numel() == 0:
-                    self._prefix_events[key] = None
-                    continue
-                local = self._local_family_buffer(family, layer_id)
-                remote = self._remote_buffers[family]
-                self._launch_allgather_selected(
-                    local, remote, sel, layer_id, group, keepalive
-                )
-                launched.append((key, len(keepalive)))
-            event = torch.npu.Event()
-            event.record(comm)
-        for key, _ in launched:
-            self._prefix_events[key] = event
-
     def prefetch_read(self, layer_id: int) -> None:
         """Launch this layer's fresh-portion transfers on the comm stream.
 
@@ -940,57 +894,6 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         silently reintroduced.
         """
         self._require_prefetched_reads = require_prefetched_reads
-
-    def prefetch_read(self, layer_id: int) -> None:
-        """Launch this layer's remote reads on the comm stream.
-
-        Call right after the layer's writes are enqueued on the current
-        stream: the transfer then overlaps the layer's remaining compute and
-        the later ``_read_layer_buffer`` only waits on the recorded event.
-        Requires the active-page staging plan (the async launch supports the
-        selected-page transfer only). Families follow the layer's compression
-        ratio. Both CP ranks issue symmetrically.
-        """
-        if not self._prefetch_enabled:
-            return
-        ratio = self.layer_mapping[layer_id].compress_ratio
-        # every layer reads its swa-window buffer; compressed layers add their
-        # sparse families on top
-        if ratio == 0:
-            families = ("swa",)
-        elif ratio == 128:
-            families = ("swa", "c128")
-        else:
-            families = ("swa", "c4", "index_k", "index_scale")
-        for family in families:
-            self._prefetch_family(family, layer_id)
-
-    def _prefetch_family(self, family: str, layer_id: int) -> None:
-        if self._remote_layer_cache[family] == layer_id:
-            return
-        pending = self._prefetch_pending.get(family)
-        if pending is not None and pending[0] == layer_id:
-            return
-        selected = (self._staging_plan or {}).get(
-            self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
-        )
-        if selected is None or selected.numel() >= self._remote_buffers[family].shape[0]:
-            return
-        local = self._local_family_buffer(family, layer_id)
-        remote = self._remote_buffers[family]
-        group = get_parallel().attn_cp_group
-        if self._comm_stream is None:
-            self._comm_stream = torch.npu.Stream()
-        comm = self._comm_stream
-        comm.wait_stream(torch.npu.current_stream())
-        keepalive: list = []
-        with torch.npu.stream(comm):
-            self._launch_allgather_selected(
-                local, remote, selected, layer_id, group, keepalive
-            )
-            event = torch.npu.Event()
-            event.record(comm)
-        self._prefetch_pending[family] = (layer_id, event, tuple(keepalive))
 
     def _launch_allgather_selected(
         self,
