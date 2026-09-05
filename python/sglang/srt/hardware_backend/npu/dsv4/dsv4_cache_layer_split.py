@@ -361,6 +361,9 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         # prefix transfers are tracked per (family, layer_id) in
         # _prefix_events (event or None when the portion was empty).
         self._prefix_events: Dict[Tuple[str, int], Optional[torch.npu.Event]] = {}
+        self._fresh_pending: Dict[str, Optional[Tuple[int, torch.npu.Event]]] = {
+            family: None for family in _REMOTE_FAMILIES
+        }
         self._prefetch_pending: Dict[str, Optional[Tuple[int, Any, tuple]]] = {
             family: None for family in _REMOTE_FAMILIES
         }
