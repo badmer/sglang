@@ -532,12 +532,21 @@ class C4IndexerAscendBackendMixin:
 
     def _maybe_prefetch_layer_splits(self, layer_id: int) -> None:
         """Layer split: the layer's writes are queued on the current stream —
-        launch its remote reads on the comm stream now so they overlap the
-        indexer/attention compute; the pool's read entry waits on the event."""
+        launch the fresh-portion transfers on the comm stream now so they
+        overlap the remaining compute; the pool's read entry waits on the
+        event."""
         prefetch_read = getattr(self.token_to_kv_pool, "prefetch_read", None)
         if prefetch_read is None:
             return
         prefetch_read(layer_id)
+
+    def _maybe_prefetch_next_layer_prefix(self, layer_id: int) -> None:
+        """Layer split: queue this layer's prefix-portion transfers (stable
+        pages written by earlier chunks) on the comm stream."""
+        prefetch_prefix = getattr(self.token_to_kv_pool, "prefetch_prefix", None)
+        if prefetch_prefix is None:
+            return
+        prefetch_prefix(layer_id)
 
     def _forward_prepare(
         self,
@@ -1083,12 +1092,16 @@ class DeepseekV4AscendAttnBackend(
         # collectives — stay symmetric even when one rank gets zero tokens.
         begin_staging = getattr(self.token_to_kv_pool, "begin_forward_staging", None)
         if begin_staging is not None:
+            prefix_lens = self._to_cpu_int_list(
+                getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            )
             begin_staging(
                 {
                     "swa": full_fields["swa_page_table"],
                     "c4": full_fields["c4_page_table"],
                     "c128": full_fields["c128_page_table"],
-                }
+                },
+                prefix_lens=prefix_lens,
             )
             prepare_forward = getattr(self.token_to_kv_pool, "prepare_forward", None)
             if prepare_forward is not None:
@@ -1893,16 +1906,24 @@ class DeepseekV4AscendAttnBackend(
         # idle ranks only feed the MoE collectives; skip attn + store_cache and return zeros
         if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(q)
+        # Layer split: launch this layer's prefix-portion transfers (they read
+        # only pages written by earlier chunks — stable), and the previous
+        # hook already queued the fresh portion at the store below.
+        self._maybe_prefetch_next_layer_prefix(layer.layer_id)
         # MQALayer prepass already stores K and passes save_kv_cache=False; True callers still get the write
         if save_kv_cache:
             self.store_cache(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
         if compress_ratio == 0:
-            return self._forward_swa(q, layer, forward_batch, attn_sink)
-        return self._forward_compressed(
-            q, layer, forward_batch, attn_sink, compress_ratio
-        )
+            result = self._forward_swa(q, layer, forward_batch, attn_sink)
+        else:
+            result = self._forward_compressed(
+                q, layer, forward_batch, attn_sink, compress_ratio
+            )
+        # overlap the next layer's prefix transfer with this layer's tail
+        self._maybe_prefetch_next_layer_prefix(layer.layer_id + 1)
+        return result
 
     def _forward_swa(
         self,

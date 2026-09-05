@@ -71,6 +71,8 @@ _LS_CHUNK_BYTES = envs.SGLANG_DSV4_LS_CHUNK_BYTES.get()
 assert _LS_CHUNK_BYTES > 0, "SGLANG_DSV4_LS_CHUNK_BYTES must be positive"
 _LS_DEBUG_VERBOSE = False
 _LS_FINGERPRINT_BLOCKS = 16
+# marks a (family, layer) whose async transfer was never launched
+_NOT_LAUNCHED = object()
 
 
 def _fingerprint_equal(lo: torch.Tensor, hi: torch.Tensor) -> bool:
@@ -345,10 +347,20 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             family: None for family in _REMOTE_FAMILIES
         }
         # Active-page plan of the current forward (set by the attention
-        # backend once per forward): family -> sorted page ids to transfer.
+        # backend once per forward), split by write stability:
+        # - prefix pages were written by earlier chunks: stable for the whole
+        #   forward, prefetched up front (prefetch_prefix)
+        # - fresh pages are written by this forward's per-layer stores: they
+        #   can only transfer after each layer's write (prefetch_read)
+        self._staging_prefix: Dict[str, torch.Tensor] = {}
+        self._staging_fresh: Dict[str, torch.Tensor] = {}
+        self._staging_selected: Dict[str, torch.Tensor] = {}
         self._staging_plan: Optional[Dict[str, torch.Tensor]] = None
         # Async remote reads: family -> (layer_id, event, keepalive) for the
-        # transfer launched on the comm stream and not yet consumed.
+        # fresh transfer launched on the comm stream and not yet consumed;
+        # prefix transfers are tracked per (family, layer_id) in
+        # _prefix_events (event or None when the portion was empty).
+        self._prefix_events: Dict[Tuple[str, int], Optional[torch.npu.Event]] = {}
         self._prefetch_pending: Dict[str, Optional[Tuple[int, Any, tuple]]] = {
             family: None for family in _REMOTE_FAMILIES
         }
@@ -370,44 +382,85 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
     _STAGING_PLAN_FAMILY_ALIAS = {"index_k": "c4", "index_scale": "c4"}
 
     def begin_forward_staging(
-        self, tables: Dict[str, Optional[torch.Tensor]]
+        self,
+        tables: Dict[str, Optional[torch.Tensor]],
+        prefix_lens: Optional[List[int]] = None,
     ) -> None:
-        """Record the forward's active pages per family (CP-group union).
+        """Record the forward's active pages per family (CP-group union),
+        split into prefix/fresh portions by each request's cached-prefix
+        length.
 
         Called once per prefill forward by the attention backend with the
-        per-family page tables; both CP ranks call symmetrically. Reads of
-        non-owned layers then transfer only these pages, scattered at their
-        original page ids, so consumer page tables need no remap. Pages
-        outside the union are never addressed by this forward's attention.
+        per-family page tables; both CP ranks call symmetrically. Prefix
+        pages were written by earlier chunks (stable all forward) and are
+        prefetched up front; fresh pages are written by this forward's
+        per-layer stores and transfer only after each layer's write. Reads of
+        non-owned layers scatter the pages at their original page ids, so
+        consumer page tables need no remap; pages outside the union are never
+        addressed by this forward's attention.
         """
+        spans = {
+            "swa": self.swa_kv_pool.kernel_page_size,
+            "c4": self.c4_kv_pool.kernel_page_size * 4,
+            "c128": self.c128_kv_pool.kernel_page_size * 128,
+        }
         group = get_parallel().attn_cp_group
-        plan: Dict[str, torch.Tensor] = {}
         for family, table in tables.items():
             remote = self._remote_buffers.get(family)
             if remote is None or table is None or table.numel() == 0:
                 continue
             max_pages = remote.shape[0]
+            span = spans.get(family)
             flat = table.reshape(-1).to(torch.long)
-            valid = (flat >= 0) & (flat < max_pages)
-            mask = torch.zeros(max_pages, dtype=torch.int32, device=flat.device)
-            mask.index_add_(
-                0,
-                flat[valid],
-                torch.ones(int(valid.sum()), dtype=torch.int32, device=flat.device),
-            )
-            torch.distributed.all_reduce(mask, group=group.device_group)
-            plan[family] = torch.nonzero(mask, as_tuple=False).flatten()
-        self._staging_plan = plan
+            in_range = (flat >= 0) & (flat < max_pages)
+            if prefix_lens is not None and span is not None:
+                lens = torch.as_tensor(prefix_lens, dtype=torch.long, device=flat.device)
+                prefix_pages_per_row = (lens + span - 1) // span
+                is_prefix = (
+                    torch.arange(table.shape[1], device=flat.device)[None, :]
+                    < prefix_pages_per_row[:, None]
+                ).reshape(-1)
+            else:
+                is_prefix = torch.zeros_like(flat, dtype=torch.bool)
+            masks = []
+            for want_prefix in (True, False):
+                pick = is_prefix if want_prefix else ~is_prefix
+                mask = torch.zeros(max_pages, dtype=torch.int32, device=flat.device)
+                hit = in_range & pick
+                mask.index_add_(
+                    0,
+                    flat[hit],
+                    torch.ones(int(hit.sum()), dtype=torch.int32, device=flat.device),
+                )
+                masks.append(mask)
+            stacked = torch.stack(masks)
+            torch.distributed.all_reduce(stacked, group=group.device_group)
+            self._staging_prefix[family] = torch.nonzero(
+                stacked[0], as_tuple=False
+            ).flatten()
+            self._staging_fresh[family] = torch.nonzero(
+                stacked[1], as_tuple=False
+            ).flatten()
+            self._staging_selected[family] = torch.nonzero(
+                stacked[0] + stacked[1], as_tuple=False
+            ).flatten()
+        # per-forward state: prior entries (stale layer/plan keys) are dropped
+        self._prefix_events = {}
+        self._staging_plan = tables
         if _LS_DEBUG:
-            for family, sel in plan.items():
+            for family in self._staging_selected:
+                pre = self._staging_prefix[family]
+                fresh = self._staging_fresh[family]
                 logger.warning(
-                    "LSPLAN rank=%d family=%s pages=%d/%d",
+                    "LSPLAN rank=%d family=%s pages=%d (prefix=%d fresh=%d)/%d",
                     self.layer_shard_rank,
                     family,
-                    int(sel.numel()),
+                    int(pre.numel() + fresh.numel()),
+                    int(pre.numel()),
+                    int(fresh.numel()),
                     self._remote_buffers[family].shape[0],
                 )
-            if not plan:
+            if not self._staging_selected:
                 logger.warning("LSPLAN rank=%d empty plan", self.layer_shard_rank)
 
     def _self_test_delivery(self) -> None:
@@ -483,31 +536,63 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LSSELF failed: %s", exc)
         target = local if local is not None else remote
-        # Consume a prefetched transfer for this family when it matches; a
-        # stale pending transfer (different layer) is waited on and discarded
-        # so the fresh read below cannot race the comm stream's writes.
-        pending = self._prefetch_pending.get(family)
-        if pending is not None:
-            self._prefetch_pending[family] = None
-            pending_layer, event = pending[0], pending[1]
-            torch.npu.current_stream().wait_event(event)
-            if pending_layer == layer_id:
+        alias_family = self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
+        stream = torch.npu.current_stream()
+        covered = False
+        if self._staging_plan is not None:
+            # Consume this layer's async transfers: the prefix portion
+            # (launched up front / by the previous layer) and the fresh
+            # portion (launched by this layer's write paths). A stale fresh
+            # pending (different layer) is waited on so its scratch writes
+            # cannot race the sync fallback below.
+            prefix_ev = self._prefix_events.pop(
+                (alias_family, layer_id), _NOT_LAUNCHED
+            )
+            fresh = self._fresh_pending.get(family)
+            self._fresh_pending[family] = None
+            if prefix_ev is not None:
+                stream.wait_event(prefix_ev)
+            if fresh is not None:
+                stream.wait_event(fresh[1])
+                covered = fresh[0] == layer_id
+            covered = covered and prefix_ev is not _NOT_LAUNCHED
+            if (
+                self._require_prefetched_reads
+                and self._prefetch_enabled
+                and local is None
+                and not covered
+            ):
+                raise RuntimeError(
+                    f"layer split: non-owned read {family}:{layer_id} without "
+                    "a prefetched transfer — the async read hooks were lost"
+                )
+            if covered:
                 self._remote_layer_cache[family] = layer_id
                 self._read_seq += 1
+                if _LS_DEBUG:
+                    # Whole-buffer fingerprints are meaningless under staging:
+                    # untouched scratch pages stay stale by design.
+                    logger.warning(
+                        "LSDBG-STAGING rank=%d seq=%d %s:%d pages=%d/%d",
+                        self.layer_shard_rank,
+                        self._read_seq,
+                        family,
+                        layer_id,
+                        int(self._staging_selected[alias_family].numel()),
+                        remote.shape[0],
+                    )
                 return target
-        if self._require_prefetched_reads and self._prefetch_enabled and local is None:
-            raise RuntimeError(
-                f"layer split: non-owned read {family}:{layer_id} without a "
-                "prefetched transfer — the async read hooks were lost"
-            )
+            selected = self._staging_selected.get(alias_family)
+        else:
+            selected = None
         # attn_cp_group must have no other submitters while layer split is on:
         # the duplicate attn_cp_overlap group (bootstrap.py) owns the side
         # -stream CP collectives, and HCCL pairs this group's collectives by
         # submission order only.
         group = get_parallel().attn_cp_group
-        selected = (self._staging_plan or {}).get(
-            self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
-        )
+        if _LS_DEBUG and _LS_SYNC:
+            torch.npu.synchronize()
+        pre = _probe_stats(target) if _LS_DEBUG else None
         if selected is not None and selected.numel() < remote.shape[0]:
             self._read_via_allgather_selected(
                 family, layer_id, local, remote, selected, group
@@ -676,6 +761,181 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         """
         self._require_prefetched_reads = require_prefetched_reads
 
+    def prefetch_prefix(self, layer_id: int) -> None:
+        """Launch this layer's prefix-portion transfers on the comm stream.
+
+        Prefix pages were written by earlier chunks and stay stable for the
+        whole forward, so this is safe any time before the layer's reads;
+        calling it at the end of the previous layer's forward overlaps the
+        transfer with that layer's compute. Idempotent per forward.
+        """
+        if not self._prefetch_enabled or self._staging_plan is None:
+            return
+        if layer_id >= self.layer_num:
+            return
+        ratio = self.layer_mapping[layer_id].compress_ratio
+        if ratio == 0:
+            families = ("swa",)
+        elif ratio == 128:
+            families = ("swa", "c128")
+        else:
+            families = ("swa", "c4", "index_k", "index_scale")
+        group = get_parallel().attn_cp_group
+        if self._comm_stream is None:
+            self._comm_stream = torch.npu.Stream()
+        comm = self._comm_stream
+        comm.wait_stream(torch.npu.current_stream())
+        keepalive: list = []
+        launched: list = []
+        with torch.npu.stream(comm):
+            for family in families:
+                key = (family, layer_id)
+                if key in self._prefix_events:
+                    continue
+                sel = self._staging_prefix.get(family)
+                if sel is None or sel.numel() == 0:
+                    self._prefix_events[key] = None
+                    continue
+                local = self._local_family_buffer(family, layer_id)
+                remote = self._remote_buffers[family]
+                self._launch_allgather_selected(
+                    local, remote, sel, layer_id, group, keepalive
+                )
+                launched.append((key, len(keepalive)))
+            event = torch.npu.Event()
+            event.record(comm)
+        for key, _ in launched:
+            self._prefix_events[key] = event
+
+    def prefetch_prefix(self, layer_id: int) -> None:
+        """Launch this layer's prefix-portion transfers on the comm stream.
+
+        Prefix pages were written by earlier chunks and stay stable for the
+        whole forward, so this is safe any time before the layer's reads;
+        calling it at the end of the previous layer's forward overlaps the
+        transfer with that layer's compute. Idempotent per forward.
+        """
+        if not self._prefetch_enabled or self._staging_plan is None:
+            return
+        if layer_id >= self.layer_num:
+            return
+        ratio = self.layer_mapping[layer_id].compress_ratio
+        if ratio == 0:
+            families = ("swa",)
+        elif ratio == 128:
+            families = ("swa", "c128")
+        else:
+            families = ("swa", "c4", "index_k", "index_scale")
+        group = get_parallel().attn_cp_group
+        if self._comm_stream is None:
+            self._comm_stream = torch.npu.Stream()
+        comm = self._comm_stream
+        comm.wait_stream(torch.npu.current_stream())
+        keepalive: list = []
+        launched: list = []
+        with torch.npu.stream(comm):
+            for family in families:
+                key = (family, layer_id)
+                if key in self._prefix_events:
+                    continue
+                sel = self._staging_prefix.get(family)
+                if sel is None or sel.numel() == 0:
+                    self._prefix_events[key] = None
+                    continue
+                local = self._local_family_buffer(family, layer_id)
+                remote = self._remote_buffers[family]
+                self._launch_allgather_selected(
+                    local, remote, sel, layer_id, group, keepalive
+                )
+                launched.append((key, len(keepalive)))
+            event = torch.npu.Event()
+            event.record(comm)
+        for key, _ in launched:
+            self._prefix_events[key] = event
+
+    def prefetch_read(self, layer_id: int) -> None:
+        """Launch this layer's fresh-portion transfers on the comm stream.
+
+        Called from the layer's write paths: the fresh pages (this chunk's
+        output pages) can only transfer after their writes land, and the
+        layer's reads wait on the recorded event.
+        """
+        if not self._prefetch_enabled or self._staging_plan is None:
+            return
+        ratio = self.layer_mapping[layer_id].compress_ratio
+        if ratio == 0:
+            families = ("swa",)
+        elif ratio == 128:
+            families = ("c128",)
+        else:
+            families = ("c4", "index_k", "index_scale")
+        group = get_parallel().attn_cp_group
+        if self._comm_stream is None:
+            self._comm_stream = torch.npu.Stream()
+        comm = self._comm_stream
+        comm.wait_stream(torch.npu.current_stream())
+        keepalive: list = []
+        launched: list = []
+        with torch.npu.stream(comm):
+            for family in families:
+                if self._remote_layer_cache[family] == layer_id:
+                    continue
+                sel = self._staging_fresh.get(family)
+                if sel is None or sel.numel() == 0:
+                    continue
+                if (
+                    self._fresh_pending.get(family) is not None
+                    and self._fresh_pending[family][0] == layer_id
+                ):
+                    continue
+                local = self._local_family_buffer(family, layer_id)
+                remote = self._remote_buffers[family]
+                self._launch_allgather_selected(
+                    local, remote, sel, layer_id, group, keepalive
+                )
+                launched.append(family)
+            event = torch.npu.Event()
+            event.record(comm)
+            for family in launched:
+                self._fresh_pending[family] = (layer_id, event, tuple(keepalive))
+
+    def _read_via_allgather_selected(
+        self,
+        family: str,
+        layer_id: int,
+        local: Optional[torch.Tensor],
+        remote: torch.Tensor,
+        selected: torch.Tensor,
+        group,
+    ) -> None:
+        """Synchronously transfer the forward's active pages of
+        ``family``/``layer_id`` on the current stream. Both CP ranks agree on
+        ``selected`` (the group-wide union from ``begin_forward_staging``);
+        the non-owner scatters the gathered pages at their ORIGINAL page ids,
+        so consumer page tables need no remap."""
+        self._launch_allgather_selected(
+            local, remote, selected, layer_id, group, keepalive=[]
+        )
+
+    def _invalidate_wait_pending(self, family: str) -> None:
+        """Order a pending async transfer before a write overwrites the same
+        family scratch: the write must land after the transfer, not during."""
+        pending = self._prefetch_pending.get(family)
+        if pending is not None:
+            self._prefetch_pending[family] = None
+            torch.npu.current_stream().wait_event(pending[1])
+
+    def prepare_forward(self, require_prefetched_reads: bool) -> None:
+        """Reset the per-forward async-read requirement.
+
+        The attention backend sets it True once the prefill-CP page tables are
+        ready: from then on a non-owned read must hit a prefetched transfer
+        (or the cache) — falling back to a synchronous read means the prefetch
+        hooks were lost, and the stale-scratch race they prevent would be
+        silently reintroduced.
+        """
+        self._require_prefetched_reads = require_prefetched_reads
+
     def prefetch_read(self, layer_id: int) -> None:
         """Launch this layer's remote reads on the comm stream.
 
@@ -689,12 +949,14 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         if not self._prefetch_enabled:
             return
         ratio = self.layer_mapping[layer_id].compress_ratio
+        # every layer reads its swa-window buffer; compressed layers add their
+        # sparse families on top
         if ratio == 0:
             families = ("swa",)
         elif ratio == 128:
-            families = ("c128",)
+            families = ("swa", "c128")
         else:
-            families = ("c4", "index_k", "index_scale")
+            families = ("swa", "c4", "index_k", "index_scale")
         for family in families:
             self._prefetch_family(family, layer_id)
 
