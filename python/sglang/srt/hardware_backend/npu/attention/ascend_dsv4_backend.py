@@ -532,13 +532,17 @@ class C4IndexerAscendBackendMixin:
 
     def _maybe_prefetch_layer_splits(self, layer_id: int) -> None:
         """Layer split: the layer's writes are queued on the current stream —
-        launch the fresh-portion transfers on the comm stream now so they
-        overlap the remaining compute; the pool's read entry waits on the
-        event."""
-        prefetch_read = getattr(self.token_to_kv_pool, "prefetch_read", None)
+        launch both of its async portions on the comm stream now (the prefix
+        pages are stable; the fresh pages were just written) so they overlap
+        the remaining compute; the pool's read entry waits on the events."""
+        pool = self.token_to_kv_pool
+        prefetch_read = getattr(pool, "prefetch_read", None)
         if prefetch_read is None:
             return
         prefetch_read(layer_id)
+        prefetch_prefix = getattr(pool, "prefetch_prefix", None)
+        if prefetch_prefix is not None:
+            prefetch_prefix(layer_id)
 
     def _maybe_prefetch_next_layer_prefix(self, layer_id: int) -> None:
         """Layer split: queue this layer's prefix-portion transfers (stable
