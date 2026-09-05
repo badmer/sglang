@@ -444,8 +444,11 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             self._staging_selected[family] = torch.nonzero(
                 stacked[0] + stacked[1], as_tuple=False
             ).flatten()
-        # per-forward state: prior entries (stale layer/plan keys) are dropped
+        # per-forward state: prior entries (stale layer/plan keys) are dropped.
+        # A remote-read cache hit from the previous forward would suppress this
+        # forward's transfers while the plan above has moved on — reset it too.
         self._prefix_events = {}
+        self._remote_layer_cache = {family: None for family in _REMOTE_FAMILIES}
         self._staging_plan = tables
         if _LS_DEBUG:
             for family in self._staging_selected:
