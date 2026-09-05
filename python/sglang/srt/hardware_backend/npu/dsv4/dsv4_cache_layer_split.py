@@ -382,7 +382,6 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         self._self_test_pending = _LS_DEBUG
 
     # index_k / index_scale share the c4 page-id space and the c4 plan.
-    _STAGING_PLAN_FAMILY_ALIAS = {"index_k": "c4", "index_scale": "c4"}
 
     def begin_forward_staging(
         self,
@@ -447,6 +446,13 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             self._staging_selected[family] = torch.nonzero(
                 stacked[0] + stacked[1], as_tuple=False
             ).flatten()
+        # index_k / index_scale share the c4 page-id space: mirror the c4
+        # plans under their own names so every family resolves directly
+        for alias, target in (("index_k", "c4"), ("index_scale", "c4")):
+            if target in self._staging_prefix:
+                self._staging_prefix[alias] = self._staging_prefix[target]
+                self._staging_fresh[alias] = self._staging_fresh[target]
+                self._staging_selected[alias] = self._staging_selected[target]
         # per-forward state: prior entries (stale layer/plan keys) are dropped.
         # A remote-read cache hit from the previous forward would suppress this
         # forward's transfers while the plan above has moved on — reset it too.
@@ -542,7 +548,6 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LSSELF failed: %s", exc)
         target = local if local is not None else remote
-        alias_family = self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
         stream = torch.npu.current_stream()
         covered = False
         if self._staging_plan is not None:
@@ -551,9 +556,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             # portion (launched by this layer's write paths). A stale fresh
             # pending (different layer) is waited on so its scratch writes
             # cannot race the sync fallback below.
-            prefix_ev = self._prefix_events.pop(
-                (alias_family, layer_id), _NOT_LAUNCHED
-            )
+            prefix_ev = self._prefix_events.pop((family, layer_id), _NOT_LAUNCHED)
             fresh = self._fresh_pending.get(family)
             self._fresh_pending[family] = None
             if prefix_ev is not None and prefix_ev is not _NOT_LAUNCHED:
@@ -584,7 +587,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                         self._read_seq,
                         family,
                         layer_id,
-                        int(self._staging_selected[alias_family].numel()),
+                        int(selected.numel()),
                         remote.shape[0],
                     )
                 return target
@@ -730,42 +733,8 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             if flat_src is None:
                 flat_dst[start:end].copy_(gathered[owner_slot])
 
-    def _read_via_allgather_selected(
-        self,
-        family: str,
-        layer_id: int,
-        local: Optional[torch.Tensor],
-        remote: torch.Tensor,
-        selected: torch.Tensor,
-        group,
-    ) -> None:
-        """Synchronously transfer the forward's active pages of
-        ``family``/``layer_id`` on the current stream. Both CP ranks agree on
-        ``selected`` (the group-wide union from ``begin_forward_staging``);
-        the non-owner scatters the gathered pages at their ORIGINAL page ids,
-        so consumer page tables need no remap."""
-        self._launch_allgather_selected(
-            local, remote, selected, layer_id, group, keepalive=[]
-        )
 
-    def _invalidate_wait_pending(self, family: str) -> None:
-        """Order a pending async transfer before a write overwrites the same
-        family scratch: the write must land after the transfer, not during."""
-        pending = self._prefetch_pending.get(family)
-        if pending is not None:
-            self._prefetch_pending[family] = None
-            torch.npu.current_stream().wait_event(pending[1])
 
-    def prepare_forward(self, require_prefetched_reads: bool) -> None:
-        """Reset the per-forward async-read requirement.
-
-        The attention backend sets it True once the prefill-CP page tables are
-        ready: from then on a non-owned read must hit a prefetched transfer
-        (or the cache) — falling back to a synchronous read means the prefetch
-        hooks were lost, and the stale-scratch race they prevent would be
-        silently reintroduced.
-        """
-        self._require_prefetched_reads = require_prefetched_reads
 
     def prefetch_prefix(self, layer_id: int) -> None:
         """Launch this layer's prefix-portion transfers on the comm stream.
@@ -798,9 +767,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                 key = (family, layer_id)
                 if key in self._prefix_events:
                     continue
-                sel = self._staging_prefix.get(
-                    self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
-                )
+                sel = self._staging_prefix.get(family)
                 if sel is None or sel.numel() == 0:
                     self._prefix_events[key] = None
                     continue
@@ -844,9 +811,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             for family in families:
                 if self._remote_layer_cache[family] == layer_id:
                     continue
-                sel = self._staging_fresh.get(
-                    self._STAGING_PLAN_FAMILY_ALIAS.get(family, family)
-                )
+                sel = self._staging_fresh.get(family)
                 if sel is None or sel.numel() == 0:
                     continue
                 if (
