@@ -69,6 +69,14 @@ _LS_SYNC = envs.SGLANG_DSV4_LS_SYNC.get()
 # operand class that corrupts on this stack.
 _LS_CHUNK_BYTES = envs.SGLANG_DSV4_LS_CHUNK_BYTES.get()
 assert _LS_CHUNK_BYTES > 0, "SGLANG_DSV4_LS_CHUNK_BYTES must be positive"
+# Async prefix prefetch above this many pages falls back to the reader's sync
+# transfer: a large radix prefix makes every layer enqueue a multi-chunk
+# prefix all-gather whose queue depth on the comm stream hangs the EP group
+# (observed 432 pages x 14 chunks per layer).
+_PREFIX_ASYNC_MAX_PAGES = 64
+# Unconsumed prefix launches allowed in flight before further launches are
+# skipped (same fallback): bounds the comm-stream queue depth.
+_PREFIX_MAX_INFLIGHT = 2 * 5
 _LS_DEBUG_VERBOSE = False
 _LS_FINGERPRINT_BLOCKS = 16
 # marks a (family, layer) whose async transfer was never launched
@@ -360,7 +368,11 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         # fresh transfer launched on the comm stream and not yet consumed;
         # prefix transfers are tracked per (family, layer_id) in
         # _prefix_events (event or None when the portion was empty).
-        self._prefix_events: Dict[Tuple[str, int], Optional[torch.npu.Event]] = {}
+        # (family, layer) -> launch state: an Event once launched, None when
+        # the portion was empty, False when backpressure/threshold skipped it
+        # (the reader then sync-transfers those rows), absent = hook never ran.
+        self._prefix_events: Dict[Tuple[str, int], Any] = {}
+        self._prefix_inflight = 0
         self._fresh_pending: Dict[str, Optional[Tuple[int, Any, tuple]]] = {
             family: None for family in _REMOTE_FAMILIES
         }
@@ -454,6 +466,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         # A remote-read cache hit from the previous forward would suppress this
         # forward's transfers while the plan above has moved on — reset it too.
         self._prefix_events = {}
+        self._prefix_inflight = 0
         self._remote_layer_cache = {family: None for family in _REMOTE_FAMILIES}
         self._staging_plan = tables
         if _LS_DEBUG:
@@ -561,20 +574,30 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             # pending (different layer) is waited on so its scratch writes
             # cannot race the sync fallback below.
             prefix_ev = self._prefix_events.pop((family, layer_id), _NOT_LAUNCHED)
+            # False = skipped by the launch-side backpressure/threshold; the
+            # sync fallback below re-gathers the full union, so the prefix
+            # portion counts as intentionally uncovered (never a guard raise).
+            prefix_skipped = prefix_ev is False
             fresh = self._fresh_pending.get(family)
             self._fresh_pending[family] = None
             selected = self._staging_selected.get(family)
-            if prefix_ev is not None and prefix_ev is not _NOT_LAUNCHED:
+            if not prefix_skipped and (
+                prefix_ev is not None and prefix_ev is not _NOT_LAUNCHED
+            ):
+                self._prefix_inflight -= 1
                 stream.wait_event(prefix_ev)
             if fresh is not None:
                 stream.wait_event(fresh[1])
                 covered = fresh[0] == layer_id
-            covered = covered and prefix_ev is not _NOT_LAUNCHED
+            covered = covered and (
+                prefix_skipped or prefix_ev is not _NOT_LAUNCHED
+            )
             if (
                 self._require_prefetched_reads
                 and self._prefetch_enabled
                 and local is None
                 and not covered
+                and prefix_ev is _NOT_LAUNCHED
             ):
                 raise RuntimeError(
                     f"layer split: non-owned read {family}:{layer_id} without "
@@ -773,12 +796,21 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                 if sel is None or sel.numel() == 0:
                     self._prefix_events[key] = None
                     continue
+                if (
+                    sel.numel() > _PREFIX_ASYNC_MAX_PAGES
+                    or self._prefix_inflight >= _PREFIX_MAX_INFLIGHT
+                ):
+                    # Too big / too deep to prefetch safely: the reader sync-
+                    # transfers these rows instead (False = allowed fallback).
+                    self._prefix_events[key] = False
+                    continue
                 local = self._local_family_buffer(family, layer_id)
                 remote = self._remote_buffers[family]
                 self._launch_allgather_selected(
                     local, remote, sel, layer_id, group, keepalive,
                     tag=f"prefix:{family}",
                 )
+                self._prefix_inflight += 1
                 launched.append((key, len(keepalive)))
             event = torch.npu.Event()
             event.record(comm)
