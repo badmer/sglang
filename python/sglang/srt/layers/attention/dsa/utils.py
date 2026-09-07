@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 import triton
@@ -208,6 +208,55 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
             ]
         )
     return dsa_cache_seqlens
+
+
+from sglang.kernels.ops.attention.dsa.cp_split import (
+    dsa_cp_round_robin_split_q_seqs_kernel,
+)
+
+
+def dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    extra_seq = 0
+    q_seqs = []
+    for bs, cur_len in enumerate(extend_seqs):
+        cur_len += extra_seq
+        cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_rank)
+        q_seqs.append(cur_seq)
+        extra_seq = cur_len - cur_seq * cp_size
+    bs_idx = list([i for i, x in enumerate(q_seqs) if x > 0])
+    q_seqs = [q_len for q_len in q_seqs if q_len > 0]
+    return q_seqs, bs_idx
+
+
+def dsa_cp_round_robin_split_q_seqs(
+    extend_seqs_cpu, extend_seqs
+) -> Tuple[List, torch.Tensor, List, torch.Tensor]:
+    """
+    round-robin-split distributes tokens across ranks based on token_idx % cp_size.
+
+    Return:
+    ret_q_lens_cpu(List) and ret_q_lens(torch.Tensor): the partitioned length (excluding zeros) on the current cp rank
+        for each sequence after distribution across cp ranks.
+    bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
+        i.e., those with a partitioned length greater than zero.
+    """
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    # len(ret_q_lens_cpu) == len(bs_idx_cpu)
+    ret_q_lens_cpu, bs_idx_cpu = dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
+    ret_q_lens = torch.empty(
+        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
+    )
+    bs_idx = torch.empty(
+        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
+    )
+    grid = (1,)
+    dsa_cp_round_robin_split_q_seqs_kernel[grid](
+        extend_seqs, ret_q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
+    )
+    return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
 
 
 def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):

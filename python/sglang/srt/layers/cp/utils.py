@@ -119,10 +119,14 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
 
 
 def enable_cp_v2() -> bool:
-    """Return whether the strategy-based generic prefill CP path is available."""
-    from sglang.srt.utils import is_hip, is_musa, is_npu
+    """Return whether the strategy-based generic prefill CP path is available.
 
-    return not (is_hip() or is_npu() or is_musa())
+    NPU DSV4 runs the strategy flow too (its backend consumes the runner-built
+    metadata); only HIP stays on the protected legacy implementation.
+    """
+    from sglang.srt.utils import is_hip
+
+    return not is_hip()
 
 
 def is_cp_v2_active(forward_batch) -> bool:

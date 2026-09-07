@@ -58,6 +58,11 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.cp.utils import cp_round_robin_input_ids_v2
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+)
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -1534,9 +1539,17 @@ class MQALayer(MqaAttentionBase):
                 sin4,
                 qk_nope_dim=self.qk_nope_head_dim,
             )
+            kv_for_cache = kv
+            if use_cp:
+                kv_for_cache = cp_all_gather_rerange_output(
+                    kv.contiguous(),
+                    get_parallel().attn_cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
-                swa_k=kv,
+                swa_k=kv_for_cache,
                 forward_batch=forward_batch,
             )
             kv = None
@@ -1571,20 +1584,46 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
+        use_npu_cp_full_metadata = use_cp and _is_npu
         if self.indexer is not None:
-            self.indexer(
-                x=x,
-                q_lora=q_lora,
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-            )
+            if use_npu_cp_full_metadata:
+                with attn_backend.use_dsv4_cp_full_metadata(forward_batch):
+                    attn_backend.forward_indexer_compressor(
+                        x,
+                        forward_batch,
+                        self.indexer.layer_id,
+                        self.indexer.compressor,
+                    )
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                    skip_compressor=True,
+                )
+            else:
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                )
         if self.compressor is not None:
-            attn_backend.forward_core_compressor(
-                x,
-                forward_batch,
-                self.layer_id,
-                self.compressor,
-            )
+            if use_npu_cp_full_metadata:
+                with attn_backend.use_dsv4_cp_full_metadata(forward_batch):
+                    attn_backend.forward_core_compressor(
+                        x,
+                        forward_batch,
+                        self.layer_id,
+                        self.compressor,
+                    )
+            else:
+                attn_backend.forward_core_compressor(
+                    x,
+                    forward_batch,
+                    self.layer_id,
+                    self.compressor,
+                )
 
         return q, kv
 
@@ -3078,6 +3117,26 @@ class DeepseekV4Model(nn.Module):
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
+        use_prefill_cp = dsa_use_prefill_cp(forward_batch)
+        run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        if use_prefill_cp and not run_tbo:
+            input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
+            input_ids_global = input_ids
+        elif use_prefill_cp:
+            # TBO skips the branch above, but input_ids still need the CP
+            # shard (positions/hidden are split per-ubatch by the TBO path).
+            input_ids = cp_split_and_rebuild_data(forward_batch, input_ids)
+            input_ids_global = input_ids
+
+        attn_backend = get_attn_backend()
+        if _is_npu and forward_batch.attn_cp_metadata is not None:
+            attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+            local_positions = getattr(forward_batch, "dsv4_cp_local_positions", None)
+            if (
+                local_positions is not None
+                and positions.shape[0] == local_positions.shape[0]
+            ):
+                forward_batch.positions = positions
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
@@ -3274,7 +3333,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
-    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -3283,7 +3341,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
