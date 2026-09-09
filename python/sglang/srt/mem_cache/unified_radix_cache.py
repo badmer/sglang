@@ -909,10 +909,15 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # Free unaligned tail (+ deferred truncation tail)
+            # Free unaligned tail (+ deferred truncation tail); merge the two
+            # when they touch so a shared boundary page is emitted once.
             ranges = [(page_aligned_len, len(kv_indices))]
             if tail_free_start is not None:
-                ranges.append((tail_free_start, len(kv_indices_full)))
+                tail_end = len(kv_indices_full)
+                if ranges[-1][1] >= tail_free_start:
+                    ranges[-1] = (ranges[-1][0], max(ranges[-1][1], tail_end))
+                else:
+                    ranges.append((tail_free_start, tail_end))
             self.free_kv_row(req.kv, ranges)
         else:
             self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
